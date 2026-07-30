@@ -1,0 +1,16 @@
+/target
+**/target
+*.bin
+*.elf
+*.map
+
+# Local secrets: WiFi credentials, WireGuard keys, Headscale preauth keys
+.cargo/config.local.toml
+*.env
+secrets.toml
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
