@@ -33,6 +33,7 @@ pub mod harness;
 pub mod headscale;
 pub mod http;
 pub mod multipeer;
+pub mod netmap;
 pub mod register;
 pub mod ts2021;
 

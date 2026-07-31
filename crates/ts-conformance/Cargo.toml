@@ -19,5 +19,6 @@ serde_json = "1"
 # The no_std crates are linked directly for the vector-backed checks and for the
 # constants the live checks assert against. The live checks drive the harness
 # binary instead — see src/harness.rs for why both mechanisms exist.
-ts-noise.workspace = true
+ts-netmap.workspace = true
+ts-noise.workspace  = true
 wg-core.workspace  = true

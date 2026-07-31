@@ -354,6 +354,7 @@ name = "ts-conformance"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "ts-netmap",
  "ts-noise",
  "wg-core",
 ]
@@ -374,6 +375,15 @@ dependencies = [
  "subtle",
  "x25519-dalek",
  "zeroize",
+]
+
+[[package]]
+name = "ts-netmap"
+version = "0.1.0"
+dependencies = [
+ "heapless",
+ "serde_json",
+ "ts-keys",
 ]
 
 [[package]]

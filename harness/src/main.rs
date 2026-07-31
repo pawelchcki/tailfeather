@@ -114,7 +114,7 @@ const USAGE: &str = "usage:
   harness selftest <state dir>
   harness ts2021   <state dir> <server ip> <port>
   harness register <state dir> <server ip> <port> <preauth key> [--exit-node|--rotate]
-  harness map      <state dir> <server ip> <port>";
+  harness map      <state dir> <server ip> <port> [responses]";
 
 extern "C" fn rust_start(stack: *const usize) -> ! {
     let args = Args { stack };
@@ -150,18 +150,8 @@ extern "C" fn rust_start(stack: *const usize) -> ! {
             };
             let ip = parse_ipv4(ip).expect("server address must be IPv4");
             let port = parse_u16(port).expect("port must be a number");
-            let mut stream = false;
-            let mut read_only = false;
-            let mut omit_peers = false;
-            for index in 5..9 {
-                match args.get(index) {
-                    Some("--stream") => stream = true,
-                    Some("--read-only") => read_only = true,
-                    Some("--omit-peers") => omit_peers = true,
-                    _ => {}
-                }
-            }
-            control::run_map(state_dir, ip, port, stream, read_only, omit_peers)
+            let wanted = args.get(5).and_then(parse_u16).unwrap_or(1) as usize;
+            control::run_map(state_dir, ip, port, wanted.max(1))
         }
         Some("register") => {
             let (Some(state_dir), Some(ip), Some(port), Some(auth_key)) =

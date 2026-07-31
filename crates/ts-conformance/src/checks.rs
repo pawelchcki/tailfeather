@@ -8,7 +8,7 @@
 //! what is missing, so each one reads as the next piece of work rather than as
 //! a vague intention.
 
-use crate::{Area, Check, Env, Status, Target, http, multipeer, register, ts2021};
+use crate::{Area, Check, Env, Status, Target, http, multipeer, netmap, register, ts2021};
 
 pub fn all() -> &'static [Check] {
     CHECKS
@@ -244,117 +244,38 @@ static CHECKS: &[Check] = &[
         id: "netmap.fields",
         area: Area::Netmap,
         description: "handles every top-level MapResponse field the server sends",
-        run: |env| {
-            let map = match env.vector("map_response.json") {
-                Ok(v) => v,
-                Err(e) => return Status::Skip(e),
-            };
-            let Some(responses) = map.as_array() else {
-                return Status::Fail("captured map is not an array".into());
-            };
-            let mut fields: Vec<&str> = responses
-                .iter()
-                .filter_map(|r| r.as_object())
-                .flat_map(|o| o.keys().map(String::as_str))
-                .collect();
-            fields.sort();
-            fields.dedup();
-            Status::Todo(format!(
-                "no parser yet. {} response(s) captured using: {}",
-                responses.len(),
-                fields.join(", ")
-            ))
-        },
+        run: netmap::fields,
     },
     Check {
         id: "netmap.delta",
         area: Area::Netmap,
         description: "applies incremental updates, not just full maps",
-        run: |env| {
-            let map = match env.vector("map_response.json") {
-                Ok(v) => v,
-                Err(e) => return Status::Skip(e),
-            };
-            // Deltas are the case a naive parser gets wrong: they omit fields
-            // rather than repeating them, so treating every response as a full
-            // map silently discards state.
-            let deltas = map
-                .as_array()
-                .map(|responses| {
-                    responses
-                        .iter()
-                        .filter(|r| {
-                            r.get("PeersChanged").is_some()
-                                || r.get("PeersChangedPatch").is_some()
-                                || r.get("PeersRemoved").is_some()
-                        })
-                        .count()
-                })
-                .unwrap_or(0);
-            Status::Todo(format!(
-                "no parser yet. {deltas} of the captured responses are deltas, so this cannot \
-                 be skipped"
-            ))
-        },
+        run: netmap::delta,
     },
     Check {
         id: "netmap.streaming",
         area: Area::Netmap,
         description: "parses the netmap without buffering it whole",
-        run: |env| {
-            let path = env.vectors.join("map_response.json");
-            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            Status::Todo(format!(
-                "no parser yet. The captured map is {size} bytes for a two-node tailnet; \
-                 a real one will not fit in RAM if buffered"
-            ))
-        },
+        run: netmap::streaming,
     },
     Check {
         id: "netmap.compression",
         area: Area::Netmap,
         description: "handles the compression the server negotiates",
-        run: |_| {
-            Status::Todo(
-                "not implemented. Tailscale compresses map responses with zstd; whether the \
-                 server can be asked for uncompressed must be confirmed against both"
-                    .into(),
-            )
-        },
+        run: netmap::compression,
     },
     Check {
         id: "netmap.to_peers",
         area: Area::Netmap,
         description: "configures WireGuard peers from the netmap",
-        run: |_| Status::Todo("not implemented".into()),
+        run: netmap::to_peers,
     },
     // ------------------------------------------------------------------- DERP
     Check {
         id: "derp.map.parse",
         area: Area::Derp,
         description: "parses the DERP map",
-        run: |env| {
-            let map = match env.vector("map_response.json") {
-                Ok(v) => v,
-                Err(e) => return Status::Skip(e),
-            };
-            let regions = map
-                .as_array()
-                .and_then(|responses| {
-                    responses
-                        .iter()
-                        .find_map(|r| r["DERPMap"]["Regions"].as_object())
-                })
-                .map(|r| r.len())
-                .unwrap_or(0);
-            if regions == 0 {
-                return Status::Skip("captured map contains no DERP regions".into());
-            }
-            Status::Todo(format!(
-                "no parser yet. The lab advertises {regions} region(s); the hosted service \
-                 advertises dozens"
-            ))
-        },
+        run: netmap::derp_map,
     },
     Check {
         id: "derp.relay",

@@ -31,6 +31,7 @@ pub enum ControlError {
     Store(crate::store::StoreError),
     Identity(ts_keys::StoreError),
     Keys(ts_keys::DecodeError),
+    Netmap(ts_netmap::Error),
     Http2(crate::h2::H2Error),
     Json(ts_control::JsonError),
     /// The server understood the request and refused it.
@@ -51,6 +52,7 @@ impl core::fmt::Display for ControlError {
             Self::Store(e) => write!(f, "state: {e}"),
             Self::Identity(e) => write!(f, "identity: {e}"),
             Self::Keys(e) => write!(f, "key: {e}"),
+            Self::Netmap(e) => write!(f, "netmap: {e}"),
             Self::Http2(e) => write!(f, "{e}"),
             Self::Json(e) => write!(f, "{e}"),
             Self::Rejected => f.write_str("the server refused the registration"),
@@ -522,11 +524,11 @@ async fn register(
 /// compression? Every zstd decoder in Rust needs an allocator, so if the answer
 /// is no, the no-allocation property of this whole project is in question and
 /// the netmap parser cannot be written as planned.
-pub fn run_map(state_dir: &str, address: Ipv4Addr, port: u16, stream: bool, read_only: bool, omit_peers: bool) -> ! {
+pub fn run_map(state_dir: &str, address: Ipv4Addr, port: u16, wanted: usize) -> ! {
     let clock = crate::time::Clock::start();
     let reactor = Reactor::new(clock);
 
-    let work = fetch_map(&reactor, state_dir, address, port, stream, read_only, omit_peers);
+    let work = fetch_map(&reactor, state_dir, address, port, wanted);
     match crate::exec::block_on(&reactor, work) {
         Ok(()) => crate::rt::exit(0),
         Err(e) => {
@@ -542,9 +544,7 @@ async fn fetch_map(
     state_dir: &str,
     address: Ipv4Addr,
     port: u16,
-    stream: bool,
-    read_only: bool,
-    omit_peers: bool,
+    wanted: usize,
 ) -> Result<(), ControlError> {
     let store = FileStore::new(state_dir, "identity.bin").map_err(ControlError::Store)?;
     let (identity, _) = ts_keys::store::load_or_create(&store, &mut OsRng).map_err(|e| match e {
@@ -563,86 +563,175 @@ async fn fetch_map(
         node_key: &identity.node.public(),
         disco_key: &identity.disco.public(),
         hostinfo: ts_control::Hostinfo::default(),
-        stream,
-        omit_peers,
-        read_only,
+        // The long poll is the only form that returns a map at all.
+        stream: true,
+        omit_peers: false,
+        read_only: false,
         endpoints: &[],
     };
 
     let mut body = [0u8; 1024];
     let body = request.write(&mut body).map_err(ControlError::Json)?;
-    println!(
-        "-> POST {} ({} bytes) stream={stream} read_only={read_only} omit_peers={omit_peers}",
-        ts_control::map::PATH,
-        body.len()
-    );
+    println!("-> POST {} ({} bytes)", ts_control::map::PATH, body.len());
 
     // A map request must be a long poll: Headscale answers a non-streaming one
-    // with an empty 200, treating it as an endpoint update. So the response is
-    // read a chunk at a time and stopped once the first framed map has arrived,
-    // rather than waiting for an end that never comes.
+    // with an empty 200, treating it as an endpoint update.
     let stream_id = http2
         .send_request("POST", ts_control::map::PATH, host, body)
         .await
         .map_err(ControlError::Http2)?;
 
-    let mut response = [0u8; 65536];
-    let mut filled = 0;
+    let mut netmap = ts_netmap::Netmap::<{ ts_netmap::MAX_PEERS }>::new();
+    let mut frames = ts_netmap::FrameReader::new();
     let mut chunk = [0u8; 16384];
-    loop {
+    let mut applied = 0usize;
+    let mut compressed_seen = false;
+    let mut first_frame = 0usize;
+
+    let mut parser = ts_netmap::Parser::<{ ts_netmap::MAX_PEERS }>::new();
+
+    while applied < wanted {
         let (len, finished) = http2
             .read_chunk(stream_id, &mut chunk)
             .await
             .map_err(ControlError::Http2)?;
-        if len > 0 {
-            let end = filled + len;
-            if end > response.len() {
-                return Err(ControlError::ResponseTooLong);
-            }
-            response[filled..end].copy_from_slice(&chunk[..len]);
-            filled = end;
-            println!("<- {len} bytes of body ({filled} total)");
-        }
         if http2.status() != 200 {
             println!("<- status {}", http2.status());
-            println!("   {}", core::str::from_utf8(&response[..filled]).unwrap_or(""));
             return Err(ControlError::UnexpectedStatus(http2.status()));
         }
-        // Enough for the length prefix and the frame it announces.
-        if let Some(frame) = ts_control::map::frame_len(&response[..filled])
-            && filled >= ts_control::map::FRAME_HEADER_LEN + frame
-        {
+
+        let mut input: &[u8] = &chunk[..len];
+        loop {
+            let (piece, consumed) = frames.next(input).map_err(ControlError::Netmap)?;
+            input = &input[consumed..];
+            match piece {
+                ts_netmap::frame::Chunk::Body(bytes) => {
+                    if first_frame == 0 {
+                        first_frame = bytes.len();
+                        // Answering the phase gate: a zstd frame starts with
+                        // 0xfd2fb528 little-endian, plain JSON with '{'.
+                        compressed_seen = bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]);
+                    }
+                    parser.push(&mut netmap, bytes).map_err(ControlError::Netmap)?;
+                    if frames.is_complete() {
+                        frames.finish_response();
+                        // One parser per response: the netmap is carried across
+                        // them, but a JSON document is not, and feeding two into
+                        // one scanner is a syntax error rather than two maps.
+                        core::mem::take(&mut parser)
+                            .finish(&mut netmap)
+                            .map_err(ControlError::Netmap)?;
+                        applied += 1;
+                        report_netmap(&netmap, applied, compressed_seen);
+                        configure_peers(&identity, &netmap);
+                    }
+                }
+                ts_netmap::frame::Chunk::End => {
+                    applied += 1;
+                    println!("<- keepalive (zero-length response)");
+                }
+                ts_netmap::frame::Chunk::Need if consumed == 0 => break,
+                ts_netmap::frame::Chunk::Need => {}
+            }
+        }
+
+        if finished {
+            println!("!! the map stream ended after {applied} response(s)");
             break;
         }
-        if finished {
-            println!("!! the stream ended after {filled} bytes without a complete frame");
-            return Err(ControlError::ResponseTooLong);
-        }
-    }
-
-    let frame = ts_control::map::frame_len(&response[..filled]).expect("checked above");
-    let start = ts_control::map::FRAME_HEADER_LEN;
-    let payload = &response[start..start + frame];
-    println!("   first frame declares {frame} bytes");
-
-    // zstd frames begin with the magic 0xfd2fb528, little-endian; plain JSON
-    // begins with '{'. This is the answer the phase gate needs.
-    let compressed = payload.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]);
-    let json = payload.first() == Some(&b'{');
-    println!("   first bytes: {}", HexBytes(&payload[..payload.len().min(16)]));
-    evt!(
-        "{{\"event\":\"map\",\"result\":\"ok\",\"frame\":{frame},\"compressed\":{compressed},\"json\":{json}}}"
-    );
-
-    if json {
-        println!("   uncompressed JSON: omitting Compress is honoured");
-        if let Ok(text) = core::str::from_utf8(&payload[..payload.len().min(400)]) {
-            println!("   {text}…");
-        }
-    } else if compressed {
-        println!("!! zstd despite not asking for it — a decompressor would be needed");
-    } else {
-        println!("!! neither JSON nor zstd; unrecognised framing");
     }
     Ok(())
+}
+
+/// Print what one applied MapResponse left behind.
+fn report_netmap(netmap: &ts_netmap::Netmap<{ ts_netmap::MAX_PEERS }>, applied: usize, compressed: bool) {
+    println!(
+        "<- map {applied}: {} peer(s), {} DERP region(s)",
+        netmap.peers.len(),
+        netmap.derp.len()
+    );
+    for peer in netmap.peers.iter() {
+        let mut endpoint = heapless::String::<48>::new();
+        if let Some(direct) = peer.direct_endpoint() {
+            let _ = core::fmt::Write::write_fmt(&mut endpoint, format_args!("{direct}"));
+        } else {
+            let _ = endpoint.push_str("(none)");
+        }
+        let mut address = heapless::String::<24>::new();
+        if let Some(ip) = peer.tailscale_ipv4() {
+            let _ = core::fmt::Write::write_fmt(&mut address, format_args!("{ip}"));
+        }
+        println!(
+            "   peer {} {address} online={} derp={} endpoint={endpoint}",
+            peer.id, peer.online, peer.home_derp
+        );
+        evt!(
+            "{{\"event\":\"peer\",\"id\":{},\"key\":\"{}\",\"address\":\"{address}\",\"online\":{},\"derp\":{},\"endpoint\":\"{endpoint}\",\"disco\":{}}}",
+            peer.id,
+            peer.node_key,
+            peer.online,
+            peer.home_derp,
+            peer.disco_key.is_some()
+        );
+    }
+    for region in netmap.derp.iter() {
+        for node in region.nodes.iter() {
+            println!("   derp region {} '{}' {}:{}", region.id, region.code, node.host_name, node.port);
+            evt!(
+                "{{\"event\":\"derp\",\"region\":{},\"code\":\"{}\",\"host\":\"{}\",\"port\":{},\"stun\":{}}}",
+                region.id,
+                region.code,
+                node.host_name,
+                node.port,
+                node.stun_port
+            );
+        }
+    }
+    evt!(
+        "{{\"event\":\"map\",\"applied\":{applied},\"peers\":{},\"regions\":{},\"compressed\":{compressed},\"responses\":{}}}",
+        netmap.peers.len(),
+        netmap.derp.len(),
+        netmap.responses
+    );
+}
+
+/// Turn the netmap into a WireGuard peer table.
+///
+/// The node key *is* the WireGuard key — that is what makes the netmap a data
+/// plane configuration rather than a directory. Each peer the server named
+/// becomes a peer of the device, set to initiate, so whichever side notices a
+/// missing session first starts the handshake.
+///
+/// The device is built and reported rather than kept, because the tunnel itself
+/// is the next phase's work; what this proves is that a netmap contains
+/// everything needed to configure one.
+fn configure_peers(identity: &Identity, netmap: &ts_netmap::Netmap<{ ts_netmap::MAX_PEERS }>) {
+    let mut device: wg_core::Device<{ ts_netmap::MAX_PEERS }> =
+        wg_core::Device::new(identity.node.to_bytes());
+
+    let mut configured = 0usize;
+    let mut reachable = 0usize;
+    for peer in netmap.peers.iter() {
+        let Ok(id) = device.add_peer(*peer.node_key.as_bytes(), None) else {
+            println!("!! more peers than the device table holds");
+            break;
+        };
+        // Both sides of a mesh link are symmetric, unlike a gateway serving a
+        // client, so either may start the handshake.
+        let _ = device.set_initiating(id, true);
+        configured += 1;
+        if peer.direct_endpoint().is_some() {
+            reachable += 1;
+        }
+    }
+
+    // The device's own key must be the node key the server knows, or peers
+    // would encrypt to an identity this node cannot decrypt with.
+    let matches_netmap = device.public_key() == *identity.node.public().as_bytes();
+    println!(
+        "   configured {configured} wireguard peer(s), {reachable} with a direct endpoint"
+    );
+    evt!(
+        "{{\"event\":\"peers\",\"configured\":{configured},\"reachable\":{reachable},\"key_matches\":{matches_netmap}}}"
+    );
 }

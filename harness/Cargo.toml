@@ -23,6 +23,7 @@ rustix = { version = "1", default-features = false, features = ["event", "fs", "
 micro-h2   = { path = "../crates/micro-h2" }
 ts-control = { path = "../crates/ts-control" }
 ts-keys    = { path = "../crates/ts-keys" }
+ts-netmap  = { path = "../crates/ts-netmap" }
 ts-noise   = { path = "../crates/ts-noise" }
 wg-core    = { path = "../crates/wg-core" }
 
