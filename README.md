@@ -78,7 +78,7 @@ what caught the one protocol detail we had wrong — see `crates/wg-core/README.
 |----|------|-------------|
 | M1 ✅ | WiFi STA + DHCP | device gets an IP, answers `ping` |
 | M2 ✅ | WireGuard responder + in-tunnel ICMP | `wg show` reports a handshake; `ping 10.99.0.1` |
-| M3a | NAT via raw sockets (likely ICMP + UDP only) | `ping 1.1.1.1`, `dig @1.1.1.1` from the peer |
+| M3a ✅ | NAT out the uplink (UDP) | echo server sees the device's own IP; 4.3 Mbit/s |
 | M3b | NAT via an embassy-net `Driver` shim | `curl https://…` through the tunnel; 30 min soak |
 | P0 | Headscale lab over plain HTTP, pcap ground truth | captured `/ts2021` session as test vectors |
 | P1 | Machine/node/disco keys + Noise IK + controlbase | host test completes a real `/ts2021` handshake |
@@ -99,14 +99,32 @@ placeholders. Real values live in a gitignored `.env` at the repository root —
 `.env.example` and fill it in.
 
 ```sh
-scripts/flash.sh                              # build and flash, then monitor
-sudo scripts/device-peer.sh up 192.168.6.163  # this machine becomes the peer; pings the tunnel
-sudo scripts/device-peer.sh down              # remove the interface again
+scripts/flash.sh                               # build and flash, then monitor
+sudo scripts/device-peer.sh up 192.168.6.163   # this machine becomes the peer; pings the tunnel
+sudo scripts/device-peer.sh down               # remove the interface again
+sudo scripts/bench-exit.sh 192.168.6.163       # exit-node throughput benchmark
 ```
 
 The gateway is responder-only: it never starts a handshake. Whatever sits on the other end must
 be able to initiate, which is why the peer side is kernel WireGuard rather than our own
 `harness` — the harness is a responder too, so two of them have nothing to say to each other.
+
+## Measured throughput
+
+M3a forwards UDP out of the WiFi uplink from the device's own address.
+`scripts/bench-exit.sh` runs a client in a network namespace so its traffic genuinely takes the
+tunnel, and an echo server that reports the source address it observes — which is the actual
+proof of translation, and reads as the device's LAN address rather than the tunnel client's.
+
+With 1024-byte payloads on 2.4 GHz WiFi: **4.3 Mbit/s peak** through the device (2.16 Mbit/s of
+payload in each direction, 264 packets/s), and 3.85 Mbit/s sustained below 5% loss.
+
+The limit is not the cryptography. Sweeping payload size shows a fixed cost of roughly 2.3 ms
+per packet on top of a much smaller per-byte cost, which is the signature of a serialized path:
+the tunnel task handles one packet from end to end — decrypt, forward, await the reply, encrypt
+— before starting the next, so throughput tracks the WiFi round trip rather than the CPU.
+Splitting the two directions into separate tasks so they pipeline is the obvious next
+optimisation, and is where any real gain lives.
 
 ## Scope limits (v1)
 

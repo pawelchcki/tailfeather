@@ -1,49 +1,68 @@
 //! The WireGuard data path: a UDP socket on one side, [`wg_core::Device`] on
-//! the other.
+//! the other, and source NAT out of the WiFi uplink for anything the tunnel
+//! wants to forward.
 //!
-//! This mirrors `wg-core`'s `responder` example, which drives the identical
-//! sans-io API over `std::net::UdpSocket`. Only the socket and the clock differ.
+//! Everything runs in one task. The cryptography is the bottleneck by a wide
+//! margin, so there is nothing to gain from processing packets concurrently,
+//! and a single task means [`wg_core::Device`] needs no locking.
 
+use embassy_futures::select::{Either3, select3, select_array};
 use embassy_net::udp::{PacketMetadata, UdpSocket};
-use embassy_net::{Stack, udp};
-use embassy_time::{Duration, with_timeout};
+use embassy_net::{IpEndpoint, Ipv4Address, Stack, udp};
+use embassy_time::{Duration, Timer};
 use log::{info, warn};
 use static_cell::StaticCell;
 use wg_core::{Action, Device, Instant, PeerId, Rng};
 
+use crate::nat;
+
 /// The port we listen on, and the one the peer's `Endpoint` must point at.
 const LISTEN_PORT: u16 = 51820;
 
-/// How long to block on a receive before giving the timers a turn. Keepalives
-/// are due on a ten-second scale, so a quarter second is ample resolution.
+/// How long to idle before giving the timers a turn. Keepalives are due on a
+/// ten-second scale, so a quarter second is ample resolution.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Point-to-point for now: one upstream peer, so one slot.
 const PEERS: usize = 1;
 
-/// Enough for a handful of full-size datagrams to queue up while the tunnel is
+/// Enough for a handful of full-size datagrams to queue while the tunnel is
 /// busy with the ChaCha20 work of the previous one.
-const SOCKET_BUFFER_LEN: usize = 4 * wg_core::MAX_DATAGRAM_LEN;
-const SOCKET_PACKETS: usize = 8;
+const WG_BUFFER_LEN: usize = 8 * wg_core::MAX_DATAGRAM_LEN;
+const WG_PACKETS: usize = 16;
 
-static RX_META: StaticCell<[PacketMetadata; SOCKET_PACKETS]> = StaticCell::new();
-static TX_META: StaticCell<[PacketMetadata; SOCKET_PACKETS]> = StaticCell::new();
-static RX_BUFFER: StaticCell<[u8; SOCKET_BUFFER_LEN]> = StaticCell::new();
-static TX_BUFFER: StaticCell<[u8; SOCKET_BUFFER_LEN]> = StaticCell::new();
+/// Per-NAT-socket buffering. Smaller than the tunnel's, because a forwarded
+/// flow is rate-limited by the tunnel anyway.
+const NAT_BUFFER_LEN: usize = 4 * 1024;
+const NAT_PACKETS: usize = 8;
+
+static WG_RX_META: StaticCell<[PacketMetadata; WG_PACKETS]> = StaticCell::new();
+static WG_TX_META: StaticCell<[PacketMetadata; WG_PACKETS]> = StaticCell::new();
+static WG_RX_BUFFER: StaticCell<[u8; WG_BUFFER_LEN]> = StaticCell::new();
+static WG_TX_BUFFER: StaticCell<[u8; WG_BUFFER_LEN]> = StaticCell::new();
+
+static NAT_RX_META: StaticCell<[[PacketMetadata; NAT_PACKETS]; nat::SLOTS]> = StaticCell::new();
+static NAT_TX_META: StaticCell<[[PacketMetadata; NAT_PACKETS]; nat::SLOTS]> = StaticCell::new();
+static NAT_RX_BUFFER: StaticCell<[[u8; NAT_BUFFER_LEN]; nat::SLOTS]> = StaticCell::new();
+static NAT_TX_BUFFER: StaticCell<[[u8; NAT_BUFFER_LEN]; nat::SLOTS]> = StaticCell::new();
+
 static DEVICE: StaticCell<Device<PEERS>> = StaticCell::new();
 static SCRATCH: StaticCell<Scratch> = StaticCell::new();
 
-/// The three working buffers, kept out of the task's future so that the
-/// executor's task arena does not have to carry four kilobytes of stack.
+/// The working buffers, kept out of the task's future so the executor's task
+/// arena does not have to carry several kilobytes of stack.
 struct Scratch {
-    datagram: [u8; wg_core::MAX_DATAGRAM_LEN],
+    /// A received outer datagram, or a received NAT reply payload.
+    datagram: [u8; 2048],
+    /// Whatever `wg-core` is about to emit.
     out: [u8; wg_core::MAX_DATAGRAM_LEN],
-    reply: [u8; wg_core::MAX_DATAGRAM_LEN],
+    /// An inner packet we have built and are about to encapsulate.
+    inner: [u8; wg_core::budget::INNER_MTU],
 }
 
 /// The hardware RNG, which yields true random numbers here because the radio is
 /// running and mixes physical noise into it. `Trng` would additionally occupy
-/// the ADC, which buys nothing while Wi-Fi is up.
+/// the ADC, which buys nothing while WiFi is up.
 struct HwRng(esp_hal::rng::Rng);
 
 impl Rng for HwRng {
@@ -59,78 +78,230 @@ fn now() -> Instant {
 #[embassy_executor::task]
 pub async fn tunnel(stack: Stack<'static>) -> ! {
     let device = DEVICE.init(Device::new(crate::WG_PRIVATE_KEY));
-    // The id of the peer we act on always comes back from `handle_udp`, so
+    // The peer an action applies to always comes back from `handle_udp`, so
     // registration's return value is of no use here.
     device
         .add_peer(crate::WG_PEER_PUBLIC_KEY, None)
         .expect("the peer table has room for the one configured peer");
     let mut rng = HwRng(esp_hal::rng::Rng::new());
     let scratch = SCRATCH.init(Scratch {
-        datagram: [0; wg_core::MAX_DATAGRAM_LEN],
+        datagram: [0; 2048],
         out: [0; wg_core::MAX_DATAGRAM_LEN],
-        reply: [0; wg_core::MAX_DATAGRAM_LEN],
+        inner: [0; wg_core::budget::INNER_MTU],
     });
 
-    let mut socket = UdpSocket::new(
+    let mut wg_socket = UdpSocket::new(
         stack,
-        RX_META.init([PacketMetadata::EMPTY; SOCKET_PACKETS]),
-        RX_BUFFER.init([0; SOCKET_BUFFER_LEN]),
-        TX_META.init([PacketMetadata::EMPTY; SOCKET_PACKETS]),
-        TX_BUFFER.init([0; SOCKET_BUFFER_LEN]),
+        WG_RX_META.init([PacketMetadata::EMPTY; WG_PACKETS]),
+        WG_RX_BUFFER.init([0; WG_BUFFER_LEN]),
+        WG_TX_META.init([PacketMetadata::EMPTY; WG_PACKETS]),
+        WG_TX_BUFFER.init([0; WG_BUFFER_LEN]),
     );
-    socket.bind(LISTEN_PORT).expect("port 51820 is free");
-    info!("wireguard listening on :{LISTEN_PORT}");
+    wg_socket.bind(LISTEN_PORT).expect("port 51820 is free");
+
+    let mut rx_meta = NAT_RX_META.init([[PacketMetadata::EMPTY; NAT_PACKETS]; nat::SLOTS]).iter_mut();
+    let mut tx_meta = NAT_TX_META.init([[PacketMetadata::EMPTY; NAT_PACKETS]; nat::SLOTS]).iter_mut();
+    let mut rx_buffer = NAT_RX_BUFFER.init([[0; NAT_BUFFER_LEN]; nat::SLOTS]).iter_mut();
+    let mut tx_buffer = NAT_TX_BUFFER.init([[0; NAT_BUFFER_LEN]; nat::SLOTS]).iter_mut();
+    let mut nat_sockets: [UdpSocket; nat::SLOTS] = core::array::from_fn(|slot| {
+        let mut socket = UdpSocket::new(
+            stack,
+            rx_meta.next().expect("one metadata block per slot"),
+            rx_buffer.next().expect("one receive buffer per slot"),
+            tx_meta.next().expect("one metadata block per slot"),
+            tx_buffer.next().expect("one send buffer per slot"),
+        );
+        socket
+            .bind(nat::EXT_PORT_BASE + slot as u16)
+            .expect("external ports are unused");
+        socket
+    });
+    let mut table = nat::Table::new();
+
+    info!("wireguard listening on :{LISTEN_PORT}, {} NAT slots", nat::SLOTS);
 
     // We never initiate, so the peer's address is only ever learned from the
     // traffic it sends, and it may change as its NAT mapping does.
     let mut endpoint = None;
 
     loop {
-        match with_timeout(POLL_INTERVAL, socket.recv_from(&mut scratch.datagram)).await {
-            Ok(Ok((len, from))) => {
-                endpoint = Some(from);
-                match device.handle_udp(&scratch.datagram[..len], now(), &mut rng, &mut scratch.out)
-                {
-                    Ok(Action::Send { data, .. }) => {
-                        send(&socket, data, from).await;
-                    }
-                    Ok(Action::Receive { peer, packet }) => {
-                        if let Some(len) =
-                            crate::inner::icmp_echo_reply(packet, crate::WG_TUNNEL_IP, &mut scratch.reply)
-                        {
-                            encapsulate(device, peer, len, scratch, &socket, from).await;
-                        }
-                    }
-                    Ok(Action::None) => {}
-                    Err(e) => warn!("rx: {e}"),
+        // `wait_recv_ready` borrows immutably, so all the sockets can be waited
+        // on together and only the one that fired is then borrowed mutably.
+        let ready = {
+            let wg_ready = wg_socket.wait_recv_ready();
+            let nat_ready = select_array(core::array::from_fn::<_, { nat::SLOTS }, _>(|i| {
+                nat_sockets[i].wait_recv_ready()
+            }));
+            match select3(wg_ready, nat_ready, Timer::after(POLL_INTERVAL)).await {
+                Either3::First(()) => Ready::Tunnel,
+                Either3::Second(((), slot)) => Ready::Nat(slot),
+                Either3::Third(()) => Ready::Timers,
+            }
+        };
+
+        match ready {
+            Ready::Tunnel => {
+                if let Ok((len, from)) = wg_socket.recv_from(&mut scratch.datagram).await {
+                    endpoint = Some(from);
+                    handle_tunnel_datagram(
+                        device,
+                        &mut rng,
+                        scratch,
+                        len,
+                        from,
+                        &wg_socket,
+                        &mut nat_sockets,
+                        &mut table,
+                    )
+                    .await;
                 }
             }
-            Ok(Err(e)) => warn!("recv: {e:?}"),
-            // A timeout is the normal idle path, and the point at which timers
-            // get a chance to run.
-            Err(_) => {}
+            Ready::Nat(slot) => {
+                handle_nat_reply(
+                    device,
+                    scratch,
+                    slot,
+                    &nat_sockets[slot],
+                    &mut table,
+                    &wg_socket,
+                    endpoint,
+                )
+                .await;
+            }
+            Ready::Timers => {}
         }
 
         while let Action::Send { data, .. } = device.poll_timers(now(), &mut scratch.out) {
             let Some(to) = endpoint else { break };
-            send(&socket, data, to).await;
+            send(&wg_socket, data, to).await;
         }
     }
 }
 
-/// Encapsulating borrows `scratch.out` mutably while the reply is read out of
-/// `scratch.reply`, which the borrow checker only accepts once the two fields
-/// are split apart.
-async fn encapsulate(
+enum Ready {
+    Tunnel,
+    Nat(usize),
+    Timers,
+}
+
+/// Decrypt one outer datagram and act on whatever was inside it.
+#[allow(clippy::too_many_arguments)]
+async fn handle_tunnel_datagram(
+    device: &mut Device<PEERS>,
+    rng: &mut HwRng,
+    scratch: &mut Scratch,
+    len: usize,
+    from: udp::UdpMetadata,
+    wg_socket: &UdpSocket<'_>,
+    nat_sockets: &mut [UdpSocket<'_>; nat::SLOTS],
+    table: &mut nat::Table,
+) {
+    let Scratch {
+        datagram,
+        out,
+        inner,
+    } = scratch;
+
+    match device.handle_udp(&datagram[..len], now(), rng, out) {
+        Ok(Action::Send { data, .. }) => send(wg_socket, data, from).await,
+        Ok(Action::Receive { peer, packet }) => {
+            // An echo request for our own tunnel address is answered here;
+            // anything else is forwarded.
+            if let Some(reply_len) = crate::inner::icmp_echo_reply(packet, crate::WG_TUNNEL_IP, inner)
+            {
+                encapsulate_and_send(device, peer, &inner[..reply_len], out, wg_socket, from).await;
+            } else if let Some(flow) = nat::parse_udp4(packet) {
+                forward_out(nat_sockets, table, &flow).await;
+            }
+        }
+        Ok(Action::None) => {}
+        Err(e) => warn!("rx: {e}"),
+    }
+}
+
+/// Send a tunnelled UDP payload out of the uplink, from the station's own
+/// address.
+async fn forward_out(
+    nat_sockets: &mut [UdpSocket<'_>; nat::SLOTS],
+    table: &mut nat::Table,
+    flow: &nat::Udp4<'_>,
+) {
+    if flow.payload.len() > nat::MAX_PAYLOAD {
+        return;
+    }
+    let Some(slot) = table.slot_for(
+        flow.src_ip,
+        flow.src_port,
+        flow.dst_ip,
+        flow.dst_port,
+        embassy_time::Instant::now().as_millis(),
+    ) else {
+        // Every slot is busy with a live flow. Dropping is the honest response;
+        // UDP callers are expected to cope with loss.
+        return;
+    };
+
+    let destination = IpEndpoint::new(Ipv4Address::from(flow.dst_ip).into(), flow.dst_port);
+    if let Err(e) = nat_sockets[slot].send_to(flow.payload, destination).await {
+        warn!("nat send: {e:?}");
+    }
+}
+
+/// Take a reply that arrived on a NAT socket and put it back into the tunnel.
+///
+/// `endpoint` is where the peer was last heard from. A reply can only arrive
+/// after the peer sent something, so in practice it is always known by now.
+#[allow(clippy::too_many_arguments)]
+async fn handle_nat_reply(
+    device: &mut Device<PEERS>,
+    scratch: &mut Scratch,
+    slot: usize,
+    socket: &UdpSocket<'_>,
+    table: &mut nat::Table,
+    wg_socket: &UdpSocket<'_>,
+    endpoint: Option<udp::UdpMetadata>,
+) {
+    let Scratch {
+        datagram,
+        out,
+        inner,
+    } = scratch;
+
+    let Ok((len, _)) = socket.recv_from(datagram).await else {
+        return;
+    };
+    let Some(flow) = table.get(slot) else { return };
+    let Some(to) = endpoint else { return };
+    table.touch(slot, embassy_time::Instant::now().as_millis());
+
+    // The client addressed the server, so the reply must appear to come from
+    // the server, not from this gateway. That is what makes the translation
+    // invisible to the client.
+    let Some(inner_len) = nat::build_udp4(
+        flow.server_ip,
+        flow.server_port,
+        flow.client_ip,
+        flow.client_port,
+        &datagram[..len],
+        inner,
+    ) else {
+        return;
+    };
+
+    // There is exactly one configured peer, and a NAT reply belongs to whoever
+    // opened the flow, so it can only be that one.
+    encapsulate_and_send(device, PeerId(0), &inner[..inner_len], out, wg_socket, to).await;
+}
+
+async fn encapsulate_and_send(
     device: &mut Device<PEERS>,
     peer: PeerId,
-    reply_len: usize,
-    scratch: &mut Scratch,
+    packet: &[u8],
+    out: &mut [u8],
     socket: &UdpSocket<'_>,
     to: udp::UdpMetadata,
 ) {
-    let Scratch { out, reply, .. } = scratch;
-    match device.encapsulate(peer, &reply[..reply_len], now(), out) {
+    match device.encapsulate(peer, packet, now(), out) {
         Ok(Action::Send { data, .. }) => send(socket, data, to).await,
         Ok(_) => {}
         Err(e) => warn!("encapsulate: {e}"),

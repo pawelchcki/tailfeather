@@ -13,6 +13,7 @@
 )]
 
 mod inner;
+mod nat;
 mod tunnel;
 mod wifi;
 
@@ -95,8 +96,9 @@ const fn ipv4(text: &str) -> [u8; 4] {
 }
 
 /// Backs the smoltcp sockets owned by the stack: one for DHCP, one for the
-/// tunnel's UDP socket, and one spare for the control-plane work of P1 onwards.
-static STACK_RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
+/// tunnel, one per NAT slot, and a spare for the control-plane work of P1
+/// onwards.
+static STACK_RESOURCES: StaticCell<StackResources<{ 3 + nat::SLOTS }>> = StaticCell::new();
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {

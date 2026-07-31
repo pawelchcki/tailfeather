@@ -7,7 +7,7 @@
 
 /// The internet checksum of RFC 1071: the one's complement of the one's
 /// complement sum of 16-bit words.
-fn checksum(bytes: &[u8]) -> u16 {
+pub fn checksum(bytes: &[u8]) -> u16 {
     let mut sum = 0u32;
     let mut chunks = bytes.chunks_exact(2);
     for c in &mut chunks {
