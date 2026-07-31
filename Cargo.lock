@@ -408,6 +408,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ts-derp"
+version = "0.1.0"
+dependencies = [
+ "crypto_box",
+ "heapless",
+ "ts-keys",
+]
+
+[[package]]
 name = "ts-disco"
 version = "0.1.0"
 dependencies = [

@@ -82,6 +82,11 @@ impl Reactor {
         }
     }
 
+    /// The clock's milliseconds, for a caller computing its own deadline.
+    pub fn clock_millis(&self) -> u64 {
+        self.clock.millis()
+    }
+
     pub fn sleep(&self, millis: u64) -> Sleep<'_> {
         self.sleep_until(self.clock.millis() + millis)
     }

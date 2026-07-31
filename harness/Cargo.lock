@@ -414,6 +414,7 @@ dependencies = [
  "rand_core",
  "rustix",
  "ts-control",
+ "ts-derp",
  "ts-disco",
  "ts-keys",
  "ts-netmap",
@@ -708,6 +709,15 @@ dependencies = [
  "heapless",
  "ts-keys",
  "ts-noise",
+]
+
+[[package]]
+name = "ts-derp"
+version = "0.1.0"
+dependencies = [
+ "crypto_box",
+ "heapless",
+ "ts-keys",
 ]
 
 [[package]]

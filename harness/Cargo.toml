@@ -30,6 +30,7 @@ p256               = { version = "0.13", default-features = false, features = ["
 rand_core          = { version = "0.6.3", default-features = false }
 
 ts-control = { path = "../crates/ts-control" }
+ts-derp    = { path = "../crates/ts-derp" }
 ts-disco   = { path = "../crates/ts-disco" }
 ts-keys    = { path = "../crates/ts-keys" }
 ts-netmap  = { path = "../crates/ts-netmap" }

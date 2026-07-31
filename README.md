@@ -50,6 +50,7 @@ crates/micro-h2   minimal no-alloc HTTP/2 client: framing, HPACK, a few streams
 crates/ts-control control-plane messages: registration, Hostinfo, no-alloc JSON
 crates/ts-netmap streaming MapResponse parser: peers, deltas, DERP map
 crates/ts-disco   path discovery: NaCl-boxed pings on the WireGuard socket
+crates/ts-derp    DERP v2 client: relaying when no direct path exists
 harness/          no_std binary for x86_64-unknown-linux-none: runs the SAME library
                   crates against real wg-quick / Headscale on the dev machine, no ESP32
 ```

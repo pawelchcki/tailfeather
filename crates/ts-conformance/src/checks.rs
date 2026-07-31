@@ -9,7 +9,7 @@
 //! a vague intention.
 
 use crate::{
-    Area, Check, Env, Status, Target, disco, exit, http, multipeer, netmap, register, tls,
+    Area, Check, Env, Status, Target, derp, disco, exit, http, multipeer, netmap, register, tls,
     ts2021,
 };
 
@@ -277,13 +277,7 @@ static CHECKS: &[Check] = &[
         id: "derp.relay",
         area: Area::Derp,
         description: "relays through DERP when no direct path exists",
-        run: |_| {
-            Status::Todo(
-                "not implemented. Skippable on a LAN where peers reach each other directly, \
-                 but the hosted service depends on it"
-                    .into(),
-            )
-        },
+        run: derp::relay,
     },
     // ------------------------------------------------------------------ disco
     Check {

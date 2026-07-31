@@ -29,6 +29,7 @@
 //! could not run, which is never counted as success.
 
 pub mod checks;
+pub mod derp;
 pub mod disco;
 pub mod exit;
 pub mod harness;

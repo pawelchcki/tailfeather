@@ -33,6 +33,7 @@ pub enum ControlError {
     Keys(ts_keys::DecodeError),
     Netmap(ts_netmap::Error),
     Disco(ts_disco::Error),
+    Derp(ts_derp::Error),
     Http2(crate::h2::H2Error),
     Json(ts_control::JsonError),
     /// The server understood the request and refused it.
@@ -55,6 +56,7 @@ impl core::fmt::Display for ControlError {
             Self::Keys(e) => write!(f, "key: {e}"),
             Self::Netmap(e) => write!(f, "netmap: {e}"),
             Self::Disco(e) => write!(f, "disco: {e}"),
+            Self::Derp(e) => write!(f, "derp: {e}"),
             Self::Http2(e) => write!(f, "{e}"),
             Self::Json(e) => write!(f, "{e}"),
             Self::Rejected => f.write_str("the server refused the registration"),
@@ -384,7 +386,7 @@ pub fn json_string<'a>(body: &'a [u8], field: &str) -> Option<&'a str> {
 }
 
 /// `a.b.c.d:port`, for the `Host` header.
-fn write_host(address: Ipv4Addr, port: u16, out: &mut [u8; 32]) -> &str {
+pub fn write_host(address: Ipv4Addr, port: u16, out: &mut [u8; 32]) -> &str {
     use core::fmt::Write as _;
 
     struct Buffer<'a>(&'a mut [u8; 32], usize);
