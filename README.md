@@ -29,13 +29,29 @@ compatible node must exhibit and gives each one a status, so the gap is explicit
 countable rather than vague.
 
 ```sh
-scripts/conformance.sh --capture   # start the references, capture ground truth, print the matrix
+tests/lab/lab.sh up && tests/lab/lab.sh reference   # a real Headscale and a real client
+tests/lab/tls.sh up                                 # a TLS front, for the TLS client
+scripts/conformance.sh                              # the matrix
+scripts/conformance.sh --capture                    # re-capture ground truth first
 ```
 
-**Currently 9 of 34 behaviours verified.** The data plane and exit-node forwarding are done;
-the entire control plane is not. See `tests/README.md` for what the framework has already
-established about the real servers — including that Headscale v0.29.3 rejects any client
-advertising a capability version below 113.
+**Currently 34 of 34 behaviours verified against Headscale v0.29.3 and tailscaled 1.94.2.**
+
+What that does and does not mean. Every check is answered either by a reference implementation
+during the run — Headscale, a real `tailscaled`, the Linux kernel's WireGuard — or by bytes
+captured from one. Nothing counts as passing because our code agrees with itself; that rule has
+paid for itself repeatedly, most recently when disco sealed and opened its own NaCl boxes
+perfectly and a real client answered "failed to open naclbox (wrong rcpt?)", because NaCl puts
+the Poly1305 tag before the ciphertext and every other AEAD in this tree appends it.
+
+The measurement is against the **lab**. Two things stand between here and hosted Tailscale, and
+both are named in the checks that touch them rather than hidden: `controlplane.tailscale.com`
+serves an RSA-PSS-only certificate chain, and `embedded-tls`'s RSA support requires an
+allocator, so the verified chain here is ECDSA P-256; and whether the hosted service honours a
+`MapRequest` that omits `Compress` is unknown, which matters because every zstd decoder in Rust
+needs a heap. See `tests/README.md` for what else the framework has established about the real
+servers — including that Headscale v0.29.3 rejects any client advertising a capability version
+below 113.
 
 ## Layout
 
@@ -116,12 +132,16 @@ implementation rather than against ourselves is what caught the one protocol det
 | M3a ✅ | NAT out the uplink (UDP) | echo server sees the device's own IP; 4.3 Mbit/s |
 | M3 ✅ | TCP forwarding | `curl` and `https://` through the tunnel from the device's IP |
 | M3b | `Driver` shim (only if raw sockets prove insufficient) | 30 min soak |
-| P0 | Headscale lab over plain HTTP, pcap ground truth | captured `/ts2021` session as test vectors |
-| P1 | Machine/node/disco keys + Noise IK + controlbase | host test completes a real `/ts2021` handshake |
-| P2 | `micro-h2` + `RegisterRequest` with a preauth key | node appears in `headscale nodes list` |
-| P3 | `MapRequest` long-poll + streaming netmap parse | tailnet ping between peers |
-| P4 | Disco on the shared WireGuard socket | connections report as "direct" |
-| P5 | Exit-node advertisement + route approval | laptop routes all traffic through the device |
+| P0 | Headscale lab over plain HTTP, pcap ground truth | captured `/ts2021` session as test vectors ✅ |
+| P1 | Machine/node/disco keys + Noise IK + controlbase | the harness completes a real `/ts2021` handshake ✅ |
+| P2 | `micro-h2` + `RegisterRequest` with a preauth key | node appears in `headscale nodes list` ✅ |
+| P3 | `MapRequest` long-poll + streaming netmap parse | a live netmap configures WireGuard peers ✅ |
+| P4 | Disco on the shared WireGuard socket | a real `tailscaled` answers our probe, and we answer its ✅ |
+| P5 | Exit-node advertisement + route approval | the server serves both default routes for us ✅ |
+
+Every one of these is done in the **harness** — the `no_std`, no-libc, no-allocator binary that
+runs the same library crates the firmware does. What remains is wiring them into the firmware
+itself, which is composition rather than protocol work.
 
 M1 and M2 are complete and verified on real hardware: an ESP32-C6 joins the WiFi network, takes
 a DHCP lease, and completes a WireGuard handshake with the Linux kernel's implementation, which
@@ -189,7 +209,7 @@ optimisation, and is where any real gain lives.
 
 ## Scope limits (v1)
 
-IPv4 only. MTU 1280 on the client side, no fragmentation. WireGuard responder-only — the peer
+IPv4 only. MTU 1280 on the client side, no fragmentation. The firmware is WireGuard responder-only — the peer
 always initiates, and rekeying works by expiring the session so the peer re-initiates. No
 cookie/mac2 DoS machinery (the replay window *is* implemented). Throughput of a few Mbps.
 
