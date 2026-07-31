@@ -32,6 +32,7 @@ pub enum ControlError {
     Identity(ts_keys::StoreError),
     Keys(ts_keys::DecodeError),
     Netmap(ts_netmap::Error),
+    Disco(ts_disco::Error),
     Http2(crate::h2::H2Error),
     Json(ts_control::JsonError),
     /// The server understood the request and refused it.
@@ -53,6 +54,7 @@ impl core::fmt::Display for ControlError {
             Self::Identity(e) => write!(f, "identity: {e}"),
             Self::Keys(e) => write!(f, "key: {e}"),
             Self::Netmap(e) => write!(f, "netmap: {e}"),
+            Self::Disco(e) => write!(f, "disco: {e}"),
             Self::Http2(e) => write!(f, "{e}"),
             Self::Json(e) => write!(f, "{e}"),
             Self::Rejected => f.write_str("the server refused the registration"),
@@ -109,6 +111,17 @@ pub fn run(state_dir: &str, address: Ipv4Addr, port: u16) -> ! {
             crate::rt::exit(1)
         }
     }
+}
+
+/// Fetch the netmap, for callers that need its contents rather than a report.
+pub async fn load_netmap(
+    reactor: &Reactor,
+    state_dir: &str,
+    address: Ipv4Addr,
+    port: u16,
+    endpoints: &[&str],
+) -> Result<ts_netmap::Netmap<{ ts_netmap::MAX_PEERS }>, ControlError> {
+    fetch_map(reactor, state_dir, address, port, 1, endpoints).await
 }
 
 /// Everything up to an established channel with the early payload consumed.
@@ -528,9 +541,9 @@ pub fn run_map(state_dir: &str, address: Ipv4Addr, port: u16, wanted: usize) -> 
     let clock = crate::time::Clock::start();
     let reactor = Reactor::new(clock);
 
-    let work = fetch_map(&reactor, state_dir, address, port, wanted);
+    let work = fetch_map(&reactor, state_dir, address, port, wanted, &[]);
     match crate::exec::block_on(&reactor, work) {
-        Ok(()) => crate::rt::exit(0),
+        Ok(_) => crate::rt::exit(0),
         Err(e) => {
             println!("FAIL {e}");
             evt!("{{\"event\":\"map\",\"result\":\"fail\"}}");
@@ -545,7 +558,8 @@ async fn fetch_map(
     address: Ipv4Addr,
     port: u16,
     wanted: usize,
-) -> Result<(), ControlError> {
+    endpoints: &[&str],
+) -> Result<ts_netmap::Netmap<{ ts_netmap::MAX_PEERS }>, ControlError> {
     let store = FileStore::new(state_dir, "identity.bin").map_err(ControlError::Store)?;
     let (identity, _) = ts_keys::store::load_or_create(&store, &mut OsRng).map_err(|e| match e {
         ts_keys::store::IdentityError::Store(e) => ControlError::Store(e),
@@ -567,7 +581,10 @@ async fn fetch_map(
         stream: true,
         omit_peers: false,
         read_only: false,
-        endpoints: &[],
+        // Where peers should try to reach us. Without this the server has
+        // nothing to tell them, so nobody ever probes us and every path has to
+        // be discovered from our side alone.
+        endpoints,
     };
 
     let mut body = [0u8; 1024];
@@ -640,7 +657,7 @@ async fn fetch_map(
             break;
         }
     }
-    Ok(())
+    Ok(netmap)
 }
 
 /// Print what one applied MapResponse left behind.

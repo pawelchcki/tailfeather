@@ -36,9 +36,29 @@ pub struct Run {
     pub stdout: String,
     pub stderr: String,
     pub code: Option<i32>,
+    /// What some *other* implementation said about the run. Kept separate from
+    /// our own output, because a check that quotes the reference client is
+    /// making a stronger claim than one quoting us.
+    pub note: String,
 }
 
 impl Run {
+    pub fn from_output(output: &std::process::Output) -> Self {
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let events = stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix("#EVT "))
+            .filter_map(|json| serde_json::from_str(json).ok())
+            .collect();
+        Self {
+            events,
+            stdout,
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            code: output.status.code(),
+            note: String::new(),
+        }
+    }
+
     /// The first event of a given kind.
     pub fn event(&self, name: &str) -> Option<&Value> {
         self.events
@@ -77,20 +97,12 @@ impl Harness {
             .args(args)
             .output()
             .map_err(|e| format!("could not run the harness: {e}"))?;
+        Ok(Run::from_output(&output))
+    }
 
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        let events = stdout
-            .lines()
-            .filter_map(|line| line.strip_prefix("#EVT "))
-            .filter_map(|json| serde_json::from_str(json).ok())
-            .collect();
-
-        Ok(Run {
-            events,
-            stdout,
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            code: output.status.code(),
-        })
+    /// The binary, for a check that needs to drive it itself rather than wait.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// A directory for one check's state, distinct from every other check's.

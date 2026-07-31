@@ -8,7 +8,7 @@
 //! what is missing, so each one reads as the next piece of work rather than as
 //! a vague intention.
 
-use crate::{Area, Check, Env, Status, Target, http, multipeer, netmap, register, ts2021};
+use crate::{Area, Check, Env, Status, Target, disco, http, multipeer, netmap, register, ts2021};
 
 pub fn all() -> &'static [Check] {
     CHECKS
@@ -294,25 +294,19 @@ static CHECKS: &[Check] = &[
         id: "disco.pong",
         area: Area::Disco,
         description: "answers disco pings on the WireGuard socket",
-        run: |_| {
-            Status::Todo(
-                "not implemented. Demultiplexed from WireGuard by the magic prefix on the \
-                 shared UDP socket"
-                    .into(),
-            )
-        },
+        run: disco::pong,
     },
     Check {
         id: "disco.ping",
         area: Area::Disco,
         description: "probes peers to find a working path",
-        run: |_| Status::Todo("not implemented".into()),
+        run: disco::ping,
     },
     Check {
         id: "disco.endpoints",
         area: Area::Disco,
         description: "reports its own endpoints to the control plane",
-        run: |_| Status::Todo("not implemented".into()),
+        run: disco::endpoints,
     },
     // -------------------------------------------------------------- exit node
     Check {

@@ -12,6 +12,7 @@ members  = [
   "crates/micro-h2",
   "crates/ts-conformance",
   "crates/ts-control",
+  "crates/ts-disco",
   "crates/ts-keys",
   "crates/ts-netmap",
   "crates/ts-noise",
@@ -41,6 +42,7 @@ heapless = "0.9"
 # --- internal ---
 micro-h2 = { path = "crates/micro-h2", version = "0.1.0" }
 ts-control = { path = "crates/ts-control", version = "0.1.0" }
+ts-disco = { path = "crates/ts-disco", version = "0.1.0" }
 ts-keys  = { path = "crates/ts-keys", version = "0.1.0" }
 ts-netmap = { path = "crates/ts-netmap", version = "0.1.0" }
 ts-noise = { path = "crates/ts-noise", version = "0.1.0" }

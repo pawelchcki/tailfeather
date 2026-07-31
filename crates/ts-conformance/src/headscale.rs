@@ -17,6 +17,7 @@ pub struct Node {
     pub name: String,
     pub node_key: String,
     pub machine_key: String,
+    pub addresses: Vec<String>,
 }
 
 /// Every node the server knows about.
@@ -58,6 +59,15 @@ pub fn nodes() -> Result<Vec<Node>, String> {
             name: row["name"].as_str().unwrap_or_default().to_string(),
             node_key: row["node_key"].as_str().unwrap_or_default().to_string(),
             machine_key: row["machine_key"].as_str().unwrap_or_default().to_string(),
+            addresses: row["ip_addresses"]
+                .as_array()
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
         .collect())
 }

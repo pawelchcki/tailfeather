@@ -82,6 +82,41 @@ impl<'r> UdpSocket<'r> {
         local_v4(&self.fd)
     }
 
+    /// Which of this host's addresses would be used to reach `target`.
+    ///
+    /// A socket bound to `0.0.0.0` knows its port and nothing else, and an
+    /// endpoint advertised as `0.0.0.0:41641` is useless to a peer. Connecting a
+    /// throwaway datagram socket makes the kernel run its routing table and fill
+    /// in the source address it would choose — without sending anything, because
+    /// `connect` on UDP only sets a default destination.
+    pub fn outbound_address(target: &SocketAddrV4) -> Result<Ipv4Addr, NetError> {
+        let fd = new_socket(SocketType::DGRAM)?;
+        connect(&fd, target).map_err(NetError::Errno)?;
+        Ok(*local_v4(&fd)?.ip())
+    }
+
+    /// The address peers on other machines could reach this host at.
+    ///
+    /// Asking the routing table about the *control server* gives the wrong
+    /// answer when the server is on this machine: the route is loopback, and an
+    /// endpoint of `127.0.0.1` is one no peer can use. So the question is asked
+    /// about a public address instead, which selects whatever the default route
+    /// would use. Nothing is sent to it.
+    ///
+    /// This is not a substitute for STUN — it finds the address on *this* side
+    /// of any NAT, and a peer across one still has to learn the translated
+    /// address from the pong it sends back.
+    pub fn advertisable_address(fallback: &SocketAddrV4) -> Result<Ipv4Addr, NetError> {
+        const PUBLIC: SocketAddrV4 =
+            SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 1), 443);
+        match Self::outbound_address(&PUBLIC) {
+            Ok(address) if !address.is_loopback() && !address.is_unspecified() => Ok(address),
+            // No default route, or it is loopback: fall back to whatever reaches
+            // the control server, which is at least somewhere real.
+            _ => Self::outbound_address(fallback),
+        }
+    }
+
     fn raw(&self) -> RawFd {
         self.fd.as_raw_fd()
     }
