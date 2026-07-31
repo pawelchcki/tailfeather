@@ -1,4 +1,17 @@
 fn main() {
+    // The configuration reaches the firmware through `env!`, so a changed
+    // credential has to invalidate the build. Without this a rebuild after
+    // editing `.env` silently reflashes the previous SSID and keys.
+    for var in [
+        "WIFI_SSID",
+        "WIFI_PASSWORD",
+        "WG_PRIVATE_KEY",
+        "WG_PEER_PUBLIC_KEY",
+        "WG_TUNNEL_IP",
+    ] {
+        println!("cargo:rerun-if-env-changed={var}");
+    }
+
     linker_be_nice();
     // make sure linkall.x is the last linker script (otherwise might cause problems with flip-link)
     println!("cargo:rustc-link-arg=-Tlinkall.x");

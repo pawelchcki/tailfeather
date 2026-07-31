@@ -76,7 +76,7 @@ what caught the one protocol detail we had wrong — see `crates/wg-core/README.
 
 | ID | Goal | Verified by |
 |----|------|-------------|
-| M1 | WiFi STA + DHCP | device gets an IP, answers `ping` |
+| M1 ✅ | WiFi STA + DHCP | device gets an IP, answers `ping` |
 | M2 ✅ | WireGuard responder + in-tunnel ICMP | `wg show` reports a handshake; `ping 10.99.0.1` |
 | M3a | NAT via raw sockets (likely ICMP + UDP only) | `ping 1.1.1.1`, `dig @1.1.1.1` from the peer |
 | M3b | NAT via an embassy-net `Driver` shim | `curl https://…` through the tunnel; 30 min soak |
@@ -87,8 +87,26 @@ what caught the one protocol detail we had wrong — see `crates/wg-core/README.
 | P4 | Disco on the shared WireGuard socket | connections report as "direct" |
 | P5 | Exit-node advertisement + route approval | laptop routes all traffic through the device |
 
-M2 is complete and verified against the Linux kernel's WireGuard, on the host and in the
-harness. Running it on the ESP32 itself is pending hardware.
+M1 and M2 are complete and verified on real hardware: an ESP32-C6 joins the WiFi network, takes
+a DHCP lease, and completes a WireGuard handshake with the Linux kernel's implementation, which
+then pings it through the tunnel. The same code passes the same test on the host and in the
+harness.
+
+## Running it on a device
+
+Configuration reaches the firmware through `env!`, and `firmware/.cargo/config.toml` holds only
+placeholders. Real values live in a gitignored `.env` at the repository root — copy
+`.env.example` and fill it in.
+
+```sh
+scripts/flash.sh                              # build and flash, then monitor
+sudo scripts/device-peer.sh up 192.168.6.163  # this machine becomes the peer; pings the tunnel
+sudo scripts/device-peer.sh down              # remove the interface again
+```
+
+The gateway is responder-only: it never starts a handshake. Whatever sits on the other end must
+be able to initiate, which is why the peer side is kernel WireGuard rather than our own
+`harness` — the harness is a responder too, so two of them have nothing to say to each other.
 
 ## Scope limits (v1)
 

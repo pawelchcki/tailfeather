@@ -30,6 +30,10 @@ esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32c6", "log-04"] }
 log                    = "0.4.27"
 
 embassy-net = { version = "0.9.1", features = [
+  # smoltcp does not answer pings unless this is on, and being able to ping the
+  # gateway's LAN address is the first thing anyone reaches for when the tunnel
+  # misbehaves.
+  "auto-icmp-echo-reply",
   "dhcpv4",
   "log",
   "medium-ethernet",
