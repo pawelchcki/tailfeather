@@ -124,6 +124,263 @@ impl Table {
     }
 }
 
+/// Concurrent TCP flows. These cost only a table entry — the packets are
+/// forwarded through one shared raw socket rather than a socket each — so the
+/// table can be considerably larger than the UDP one. A single page load opens
+/// several connections at once.
+pub const TCP_SLOTS: usize = 16;
+
+/// External ports for translated TCP, one per slot, so a segment's destination
+/// port identifies its flow.
+pub const TCP_EXT_PORT_BASE: u16 = 41000;
+
+/// Idle timeout for a TCP flow. Longer than UDP's because a connection may sit
+/// silent between requests and still be very much alive.
+pub const TCP_IDLE_TIMEOUT_MS: u64 = 120_000;
+
+/// The largest MSS we let either end negotiate.
+///
+/// A segment that arrives larger than the tunnel's MTU cannot be encapsulated
+/// and is simply dropped, which presents as a connection that opens and then
+/// hangs the moment it carries real data. Clamping the option in the SYN stops
+/// that at the source instead.
+pub const MAX_MSS: u16 = (wg_core::budget::INNER_MTU - IPV4_HEADER_LEN - TCP_HEADER_LEN) as u16;
+
+const PROTO_TCP: u8 = 6;
+const TCP_HEADER_LEN: usize = 20;
+const TCP_FLAG_SYN: u8 = 0x02;
+const TCP_FLAG_RST: u8 = 0x04;
+const OPTION_END: u8 = 0;
+const OPTION_NOP: u8 = 1;
+const OPTION_MSS: u8 = 2;
+
+#[derive(Default)]
+pub struct TcpTable {
+    flows: [Option<Flow>; TCP_SLOTS],
+}
+
+impl TcpTable {
+    pub const fn new() -> Self {
+        Self {
+            flows: [None; TCP_SLOTS],
+        }
+    }
+
+    /// The slot for this connection, creating one if necessary.
+    pub fn slot_for(
+        &mut self,
+        client_ip: [u8; 4],
+        client_port: u16,
+        server_ip: [u8; 4],
+        server_port: u16,
+        now_ms: u64,
+    ) -> Option<usize> {
+        let matches = |f: &Flow| {
+            f.client_ip == client_ip
+                && f.client_port == client_port
+                && f.server_ip == server_ip
+                && f.server_port == server_port
+        };
+
+        if let Some(index) = self
+            .flows
+            .iter()
+            .position(|f| f.is_some_and(|f| matches(&f)))
+        {
+            if let Some(flow) = &mut self.flows[index] {
+                flow.last_used_ms = now_ms;
+            }
+            return Some(index);
+        }
+
+        let victim = self.flows.iter().position(Option::is_none).or_else(|| {
+            self.flows
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| {
+                    f.is_some_and(|f| now_ms.saturating_sub(f.last_used_ms) >= TCP_IDLE_TIMEOUT_MS)
+                })
+                .min_by_key(|(_, f)| f.map(|f| f.last_used_ms).unwrap_or(0))
+                .map(|(i, _)| i)
+        })?;
+
+        self.flows[victim] = Some(Flow {
+            client_ip,
+            client_port,
+            server_ip,
+            server_port,
+            last_used_ms: now_ms,
+        });
+        Some(victim)
+    }
+
+    pub fn get(&self, slot: usize) -> Option<Flow> {
+        self.flows.get(slot).copied().flatten()
+    }
+
+    pub fn touch(&mut self, slot: usize, now_ms: u64) {
+        if let Some(Some(flow)) = self.flows.get_mut(slot) {
+            flow.last_used_ms = now_ms;
+        }
+    }
+
+    /// Release a slot whose connection has been reset, so it is available again
+    /// without waiting out the idle timeout.
+    pub fn release(&mut self, slot: usize) {
+        if let Some(entry) = self.flows.get_mut(slot) {
+            *entry = None;
+        }
+    }
+}
+
+/// Source and destination ports of an inner TCP segment, plus its flags.
+pub struct TcpInfo {
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub src_ip: [u8; 4],
+    pub dst_ip: [u8; 4],
+    pub is_rst: bool,
+}
+
+pub fn parse_tcp4(packet: &[u8]) -> Option<TcpInfo> {
+    if packet.len() < IPV4_HEADER_LEN || packet[0] >> 4 != 4 || packet[9] != PROTO_TCP {
+        return None;
+    }
+    let header_len = ((packet[0] & 0x0f) as usize) * 4;
+    let tcp = packet.get(header_len..)?;
+    if tcp.len() < TCP_HEADER_LEN {
+        return None;
+    }
+    Some(TcpInfo {
+        src_port: u16::from_be_bytes([tcp[0], tcp[1]]),
+        dst_port: u16::from_be_bytes([tcp[2], tcp[3]]),
+        src_ip: packet[12..16].try_into().ok()?,
+        dst_ip: packet[16..20].try_into().ok()?,
+        is_rst: tcp[13] & TCP_FLAG_RST != 0,
+    })
+}
+
+/// RFC 1624 incremental checksum update: `HC' = ~(~HC + ~m + m')`.
+///
+/// Recomputing a TCP checksum from scratch means a pass over the whole segment.
+/// Only a few header words change during translation, and updating for just
+/// those is both cheaper and exactly what the RFC prescribes.
+fn adjust_checksum(old_sum: u16, old: &[u8], new: &[u8]) -> u16 {
+    let mut acc = (!old_sum) as u32;
+    for word in old.chunks_exact(2) {
+        acc += (!u16::from_be_bytes([word[0], word[1]])) as u32;
+    }
+    for word in new.chunks_exact(2) {
+        acc += u16::from_be_bytes([word[0], word[1]]) as u32;
+    }
+    while acc >> 16 != 0 {
+        acc = (acc & 0xffff) + (acc >> 16);
+    }
+    !(acc as u16)
+}
+
+fn rewrite_ip_checksum(ip: &mut [u8]) {
+    ip[10..12].fill(0);
+    let sum = checksum(&ip[..IPV4_HEADER_LEN]);
+    ip[10..12].copy_from_slice(&sum.to_be_bytes());
+}
+
+/// Translate a segment leaving the tunnel: it must appear to come from this
+/// gateway's own address and its allocated external port.
+pub fn rewrite_tcp_outbound(packet: &mut [u8], new_src_ip: [u8; 4], new_src_port: u16) -> bool {
+    let Some(header_len) = tcp_offset(packet) else {
+        return false;
+    };
+    let (ip, tcp) = packet.split_at_mut(header_len);
+
+    let old_sum = u16::from_be_bytes([tcp[16], tcp[17]]);
+    // The TCP checksum covers a pseudo-header containing the IP addresses, so
+    // changing the address invalidates it just as changing the port does.
+    let sum = adjust_checksum(old_sum, &ip[12..16], &new_src_ip);
+    let sum = adjust_checksum(sum, &tcp[0..2], &new_src_port.to_be_bytes());
+    tcp[16..18].copy_from_slice(&sum.to_be_bytes());
+    tcp[0..2].copy_from_slice(&new_src_port.to_be_bytes());
+    ip[12..16].copy_from_slice(&new_src_ip);
+    rewrite_ip_checksum(ip);
+    true
+}
+
+/// Translate a segment arriving for a known flow back to its tunnel client.
+pub fn rewrite_tcp_inbound(packet: &mut [u8], new_dst_ip: [u8; 4], new_dst_port: u16) -> bool {
+    let Some(header_len) = tcp_offset(packet) else {
+        return false;
+    };
+    let (ip, tcp) = packet.split_at_mut(header_len);
+
+    let old_sum = u16::from_be_bytes([tcp[16], tcp[17]]);
+    let sum = adjust_checksum(old_sum, &ip[16..20], &new_dst_ip);
+    let sum = adjust_checksum(sum, &tcp[2..4], &new_dst_port.to_be_bytes());
+    tcp[16..18].copy_from_slice(&sum.to_be_bytes());
+    tcp[2..4].copy_from_slice(&new_dst_port.to_be_bytes());
+    ip[16..20].copy_from_slice(&new_dst_ip);
+    rewrite_ip_checksum(ip);
+    true
+}
+
+/// Reduce the MSS option of a SYN to at most [`MAX_MSS`].
+///
+/// Both directions need this: the client's SYN tells the server how large a
+/// segment it may send, and the server's SYN-ACK does the same in reverse.
+pub fn clamp_mss(packet: &mut [u8]) {
+    let Some(header_len) = tcp_offset(packet) else {
+        return;
+    };
+    let tcp = &mut packet[header_len..];
+    if tcp[13] & TCP_FLAG_SYN == 0 {
+        return;
+    }
+    let data_offset = ((tcp[12] >> 4) as usize) * 4;
+    if data_offset <= TCP_HEADER_LEN || data_offset > tcp.len() {
+        return;
+    }
+
+    let mut i = TCP_HEADER_LEN;
+    while i < data_offset {
+        match tcp[i] {
+            OPTION_END => break,
+            OPTION_NOP => i += 1,
+            kind => {
+                if i + 1 >= data_offset {
+                    break;
+                }
+                let len = tcp[i + 1] as usize;
+                if len < 2 || i + len > data_offset {
+                    break;
+                }
+                if kind == OPTION_MSS && len == 4 {
+                    let mss = u16::from_be_bytes([tcp[i + 2], tcp[i + 3]]);
+                    if mss > MAX_MSS {
+                        let old = [tcp[i + 2], tcp[i + 3]];
+                        let new = MAX_MSS.to_be_bytes();
+                        let sum = u16::from_be_bytes([tcp[16], tcp[17]]);
+                        let sum = adjust_checksum(sum, &old, &new);
+                        tcp[16..18].copy_from_slice(&sum.to_be_bytes());
+                        tcp[i + 2..i + 4].copy_from_slice(&new);
+                    }
+                    return;
+                }
+                i += len;
+            }
+        }
+    }
+}
+
+fn tcp_offset(packet: &[u8]) -> Option<usize> {
+    if packet.len() < IPV4_HEADER_LEN || packet[0] >> 4 != 4 || packet[9] != PROTO_TCP {
+        return None;
+    }
+    let header_len = ((packet[0] & 0x0f) as usize) * 4;
+    if packet.len() < header_len + TCP_HEADER_LEN {
+        return None;
+    }
+    Some(header_len)
+}
+
 /// A parsed inner IPv4/UDP datagram.
 pub struct Udp4<'a> {
     pub src_ip: [u8; 4],

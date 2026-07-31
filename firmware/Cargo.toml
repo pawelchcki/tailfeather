@@ -37,6 +37,10 @@ embassy-net = { version = "0.9.1", features = [
   "dhcpv4",
   "log",
   "medium-ethernet",
+  # Forwarded TCP is translated packet by packet through a raw socket. smoltcp
+  # suppresses its own RST for anything a raw socket consumes, which is what
+  # makes this possible without a custom Driver.
+  "raw",
   "udp",
 ] }
 esp-alloc = "0.10.0"
@@ -61,6 +65,8 @@ smoltcp = { version = "0.13.0", default-features = false, features = [
   "medium-ethernet",
   "proto-dhcpv4",
   "proto-ipv4",
+  "socket-raw",
+  "socket-tcp",
   "socket-udp",
 ] }
 

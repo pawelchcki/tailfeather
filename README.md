@@ -79,7 +79,8 @@ what caught the one protocol detail we had wrong — see `crates/wg-core/README.
 | M1 ✅ | WiFi STA + DHCP | device gets an IP, answers `ping` |
 | M2 ✅ | WireGuard responder + in-tunnel ICMP | `wg show` reports a handshake; `ping 10.99.0.1` |
 | M3a ✅ | NAT out the uplink (UDP) | echo server sees the device's own IP; 4.3 Mbit/s |
-| M3b | NAT via an embassy-net `Driver` shim | `curl https://…` through the tunnel; 30 min soak |
+| M3 ✅ | TCP forwarding | `curl` and `https://` through the tunnel from the device's IP |
+| M3b | `Driver` shim (only if raw sockets prove insufficient) | 30 min soak |
 | P0 | Headscale lab over plain HTTP, pcap ground truth | captured `/ts2021` session as test vectors |
 | P1 | Machine/node/disco keys + Noise IK + controlbase | host test completes a real `/ts2021` handshake |
 | P2 | `micro-h2` + `RegisterRequest` with a preauth key | node appears in `headscale nodes list` |
@@ -102,22 +103,46 @@ placeholders. Real values live in a gitignored `.env` at the repository root —
 scripts/flash.sh                               # build and flash, then monitor
 sudo scripts/device-peer.sh up 192.168.6.163   # this machine becomes the peer; pings the tunnel
 sudo scripts/device-peer.sh down               # remove the interface again
-sudo scripts/bench-exit.sh 192.168.6.163       # exit-node throughput benchmark
+sudo scripts/bench-exit.sh 192.168.6.163       # UDP exit-node throughput benchmark
+sudo scripts/test-http.sh 192.168.6.163        # HTTP/HTTPS forwarding through the device
 ```
 
 The gateway is responder-only: it never starts a handshake. Whatever sits on the other end must
 be able to initiate, which is why the peer side is kernel WireGuard rather than our own
 `harness` — the harness is a responder too, so two of them have nothing to say to each other.
 
+## Forwarding
+
+Both UDP and TCP are forwarded out of the WiFi uplink from the device's own address, so it works
+as a general exit node: a client whose default route points into the tunnel resolves names,
+fetches HTTP, and completes TLS handshakes, all appearing to the outside world as the ESP32.
+
+The two protocols are translated differently. A UDP flow gets an ordinary `UdpSocket` on the
+station interface, so the stack writes the outer headers itself and no checksum fixup is needed.
+TCP cannot work that way — a `TcpSocket` would terminate the connection on the device instead of
+passing it through — so segments are translated individually over a raw socket, with incremental
+checksum updates (RFC 1624) and MSS clamping to the tunnel's MTU.
+
+The plan expected TCP to need a custom `Driver` shim, on the theory that smoltcp would answer
+forwarded segments with its own RST. It does not: smoltcp suppresses the RST for any packet a
+raw socket consumes, so the shim turned out to be unnecessary.
+
+MSS clamping matters more than it looks. Without it a connection opens normally and then hangs
+the instant it carries a full-size segment, because that segment exceeds the tunnel MTU and is
+silently dropped.
+
 ## Measured throughput
 
-M3a forwards UDP out of the WiFi uplink from the device's own address.
+`scripts/bench-exit.sh` measures UDP.
 `scripts/bench-exit.sh` runs a client in a network namespace so its traffic genuinely takes the
 tunnel, and an echo server that reports the source address it observes — which is the actual
 proof of translation, and reads as the device's LAN address rather than the tunnel client's.
 
 With 1024-byte payloads on 2.4 GHz WiFi: **4.3 Mbit/s peak** through the device (2.16 Mbit/s of
 payload in each direction, 264 packets/s), and 3.85 Mbit/s sustained below 5% loss.
+
+HTTP downloads through the same path run at **2.6–3.4 Mbit/s** (a 2 MiB body in 5–6 s),
+measured by `scripts/test-http.sh`.
 
 The limit is not the cryptography. Sweeping payload size shows a fixed cost of roughly 2.3 ms
 per packet on top of a much smaller per-byte cost, which is the signature of a serialized path:
