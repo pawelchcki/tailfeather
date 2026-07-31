@@ -8,7 +8,9 @@
 //! what is missing, so each one reads as the next piece of work rather than as
 //! a vague intention.
 
-use crate::{Area, Check, Env, Status, Target, disco, http, multipeer, netmap, register, ts2021};
+use crate::{
+    Area, Check, Env, Status, Target, disco, exit, http, multipeer, netmap, register, ts2021,
+};
 
 pub fn all() -> &'static [Check] {
     CHECKS
@@ -331,12 +333,6 @@ static CHECKS: &[Check] = &[
         id: "exit.advertise",
         area: Area::ExitNode,
         description: "advertises itself as an exit node",
-        run: |_| {
-            Status::Todo(
-                "not implemented. Hostinfo.RoutableIPs = 0.0.0.0/0 and ::/0, then the \
-                 server-side route approval"
-                    .into(),
-            )
-        },
+        run: exit::advertise,
     },
 ];

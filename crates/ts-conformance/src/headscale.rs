@@ -76,3 +76,88 @@ pub fn nodes() -> Result<Vec<Node>, String> {
 pub fn find_by_node_key<'a>(nodes: &'a [Node], node_key: &str) -> Option<&'a Node> {
     nodes.iter().find(|n| n.node_key == node_key)
 }
+
+/// What a node advertises, what an operator has approved, and what it is
+/// actually serving.
+#[derive(Debug, Clone, Default)]
+pub struct Routes {
+    pub available: Vec<String>,
+    pub approved: Vec<String>,
+    pub serving: Vec<String>,
+}
+
+/// `headscale nodes list-routes`, for one node.
+pub fn routes(node_id: u64) -> Result<Routes, String> {
+    let output = Command::new("podman")
+        .args([
+            "exec",
+            CONTAINER,
+            "headscale",
+            "nodes",
+            "list-routes",
+            "--output",
+            "json",
+        ])
+        .output()
+        .map_err(|e| format!("could not run podman: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "headscale nodes list-routes failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("list-routes is not JSON: {e}"))?;
+    let rows = parsed.as_array().ok_or("list-routes is not an array")?;
+    let row = rows
+        .iter()
+        .find(|row| row["id"].as_u64() == Some(node_id))
+        .ok_or_else(|| format!("node {node_id} advertises no routes"))?;
+
+    let strings = |field: &str| -> Vec<String> {
+        row[field]
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    Ok(Routes {
+        available: strings("available_routes"),
+        approved: strings("approved_routes"),
+        // What the node is actually the primary router for. Distinct from
+        // "approved": two nodes can advertise the same subnet and only one
+        // serves it.
+        serving: strings("subnet_routes"),
+    })
+}
+
+/// Approve routes on a node, which is the operator action an exit node needs
+/// before any client will use it.
+pub fn approve_routes(node_id: u64, routes: &[&str]) -> Result<(), String> {
+    let output = Command::new("podman")
+        .args([
+            "exec",
+            CONTAINER,
+            "headscale",
+            "nodes",
+            "approve-routes",
+            "--identifier",
+            &node_id.to_string(),
+            "--routes",
+            &routes.join(","),
+        ])
+        .output()
+        .map_err(|e| format!("could not run podman: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "approve-routes failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}

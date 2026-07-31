@@ -30,6 +30,7 @@
 
 pub mod checks;
 pub mod disco;
+pub mod exit;
 pub mod harness;
 pub mod headscale;
 pub mod http;
