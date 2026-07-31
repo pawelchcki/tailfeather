@@ -1,8 +1,13 @@
-# esp-gateway
+# tailfeather
 
-ESP32-C6 firmware (Rust, `no_std`, Embassy) that joins a [Tailscale](https://tailscale.com)
-network and acts as an **exit node**: WireGuard data plane, ts2021 control plane, and NAT out
-the WiFi station uplink.
+A [Tailscale](https://tailscale.com)-compatible mesh node in Rust, with no allocator, no libc
+and no operating system underneath it — and an ESP32-C6 firmware that uses it to act as an
+**exit node**: WireGuard data plane, ts2021 control plane, and NAT out the WiFi station uplink.
+
+The protocol lives in `crates/`, each piece independently publishable and none of them aware of
+a socket. `harness/` runs those same crates on `x86_64-unknown-linux-none` — the Linux syscall
+ABI and nothing else — so every claim below is made by a binary with the firmware's
+constraints rather than by a `std` test that could lean on the host.
 
 The target is compatibility with **both** hosted Tailscale and self-hosted
 [Headscale](https://headscale.net), at their current versions. Those are different problems —
