@@ -514,3 +514,135 @@ async fn register(
     );
     Ok(())
 }
+
+/// Ask for the network map once and report how the server framed it.
+///
+/// This exists to answer one question with bytes rather than with reasoning:
+/// does a server send an uncompressed map when the request does not ask for
+/// compression? Every zstd decoder in Rust needs an allocator, so if the answer
+/// is no, the no-allocation property of this whole project is in question and
+/// the netmap parser cannot be written as planned.
+pub fn run_map(state_dir: &str, address: Ipv4Addr, port: u16, stream: bool, read_only: bool, omit_peers: bool) -> ! {
+    let clock = crate::time::Clock::start();
+    let reactor = Reactor::new(clock);
+
+    let work = fetch_map(&reactor, state_dir, address, port, stream, read_only, omit_peers);
+    match crate::exec::block_on(&reactor, work) {
+        Ok(()) => crate::rt::exit(0),
+        Err(e) => {
+            println!("FAIL {e}");
+            evt!("{{\"event\":\"map\",\"result\":\"fail\"}}");
+            crate::rt::exit(1)
+        }
+    }
+}
+
+async fn fetch_map(
+    reactor: &Reactor,
+    state_dir: &str,
+    address: Ipv4Addr,
+    port: u16,
+    stream: bool,
+    read_only: bool,
+    omit_peers: bool,
+) -> Result<(), ControlError> {
+    let store = FileStore::new(state_dir, "identity.bin").map_err(ControlError::Store)?;
+    let (identity, _) = ts_keys::store::load_or_create(&store, &mut OsRng).map_err(|e| match e {
+        ts_keys::store::IdentityError::Store(e) => ControlError::Store(e),
+        ts_keys::store::IdentityError::Format(e) => ControlError::Identity(e),
+    })?;
+
+    let session = connect(reactor, state_dir, address, port).await?;
+    let mut http2 = session.into_http2().await?;
+
+    let mut host = [0u8; 32];
+    let host = write_host(address, port, &mut host);
+
+    let request = ts_control::MapRequest {
+        version: ts_control::CAPABILITY_VERSION,
+        node_key: &identity.node.public(),
+        disco_key: &identity.disco.public(),
+        hostinfo: ts_control::Hostinfo::default(),
+        stream,
+        omit_peers,
+        read_only,
+        endpoints: &[],
+    };
+
+    let mut body = [0u8; 1024];
+    let body = request.write(&mut body).map_err(ControlError::Json)?;
+    println!(
+        "-> POST {} ({} bytes) stream={stream} read_only={read_only} omit_peers={omit_peers}",
+        ts_control::map::PATH,
+        body.len()
+    );
+
+    // A map request must be a long poll: Headscale answers a non-streaming one
+    // with an empty 200, treating it as an endpoint update. So the response is
+    // read a chunk at a time and stopped once the first framed map has arrived,
+    // rather than waiting for an end that never comes.
+    let stream_id = http2
+        .send_request("POST", ts_control::map::PATH, host, body)
+        .await
+        .map_err(ControlError::Http2)?;
+
+    let mut response = [0u8; 65536];
+    let mut filled = 0;
+    let mut chunk = [0u8; 16384];
+    loop {
+        let (len, finished) = http2
+            .read_chunk(stream_id, &mut chunk)
+            .await
+            .map_err(ControlError::Http2)?;
+        if len > 0 {
+            let end = filled + len;
+            if end > response.len() {
+                return Err(ControlError::ResponseTooLong);
+            }
+            response[filled..end].copy_from_slice(&chunk[..len]);
+            filled = end;
+            println!("<- {len} bytes of body ({filled} total)");
+        }
+        if http2.status() != 200 {
+            println!("<- status {}", http2.status());
+            println!("   {}", core::str::from_utf8(&response[..filled]).unwrap_or(""));
+            return Err(ControlError::UnexpectedStatus(http2.status()));
+        }
+        // Enough for the length prefix and the frame it announces.
+        if let Some(frame) = ts_control::map::frame_len(&response[..filled])
+            && filled >= ts_control::map::FRAME_HEADER_LEN + frame
+        {
+            break;
+        }
+        if finished {
+            println!("!! the stream ended after {filled} bytes without a complete frame");
+            return Err(ControlError::ResponseTooLong);
+        }
+    }
+
+    let frame = ts_control::map::frame_len(&response[..filled]).expect("checked above");
+    let start = ts_control::map::FRAME_HEADER_LEN;
+    let payload = &response[start..start + frame];
+    println!("   first frame declares {frame} bytes");
+
+    // zstd frames begin with the magic 0xfd2fb528, little-endian; plain JSON
+    // begins with '{'. This is the answer the phase gate needs.
+    let compressed = payload.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]);
+    let json = payload.first() == Some(&b'{');
+    println!("   first bytes: {}", HexBytes(&payload[..payload.len().min(16)]));
+    evt!(
+        "{{\"event\":\"map\",\"result\":\"ok\",\"frame\":{frame},\"compressed\":{compressed},\"json\":{json}}}"
+    );
+
+    if json {
+        println!("   uncompressed JSON: omitting Compress is honoured");
+        if let Ok(text) = core::str::from_utf8(&payload[..payload.len().min(400)]) {
+            println!("   {text}…");
+        }
+    } else if compressed {
+        println!("!! zstd despite not asking for it — a decompressor would be needed");
+    } else {
+        println!("!! neither JSON nor zstd; unrecognised framing");
+    }
+    Ok(())
+}

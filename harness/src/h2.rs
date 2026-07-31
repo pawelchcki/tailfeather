@@ -66,6 +66,7 @@ pub struct Http2<'r> {
     /// Decrypted bytes not yet consumed as HTTP/2 frames.
     buffer: [u8; BUFFER],
     filled: usize,
+    status: u16,
 }
 
 impl<'r> Http2<'r> {
@@ -86,6 +87,7 @@ impl<'r> Http2<'r> {
             connection: Connection::new(),
             buffer: [0; BUFFER],
             filled: 0,
+            status: 0,
         };
         client.buffer[..pushback.len()].copy_from_slice(pushback);
         client.filled = pushback.len();
@@ -96,10 +98,10 @@ impl<'r> Http2<'r> {
         Ok(client)
     }
 
-    /// Send a request and read the response, returning its status and body.
+    /// Send a request and read the whole response.
     ///
-    /// The body is copied into `body_out` because it arrives across several
-    /// `DATA` frames, each borrowed from a buffer the next read overwrites.
+    /// Only for responses that end: a map long-poll never does, and must be
+    /// read with [`Http2::send_request`] and [`Http2::read_chunk`] instead.
     pub async fn request(
         &mut self,
         method: &str,
@@ -108,6 +110,27 @@ impl<'r> Http2<'r> {
         request_body: &[u8],
         body_out: &mut [u8],
     ) -> Result<(u16, usize), H2Error> {
+        let stream = self
+            .send_request(method, path, authority, request_body)
+            .await?;
+        let mut written = 0;
+        loop {
+            let (len, finished) = self.read_chunk(stream, &mut body_out[written..]).await?;
+            written += len;
+            if finished {
+                return Ok((self.status, written));
+            }
+        }
+    }
+
+    /// Send a request and return its stream identifier.
+    pub async fn send_request(
+        &mut self,
+        method: &str,
+        path: &str,
+        authority: &str,
+        request_body: &[u8],
+    ) -> Result<u32, H2Error> {
         let mut out = [0u8; OUT_BUFFER];
         let (stream, len) = self.connection.request(
             method,
@@ -121,15 +144,25 @@ impl<'r> Http2<'r> {
             &mut out,
         )?;
         self.send(&out[..len]).await?;
+        Ok(stream)
+    }
 
-        let mut status = 0u16;
-        let mut written = 0usize;
-
+    /// Read the next piece of a response body.
+    ///
+    /// Returns how many bytes were written and whether the stream has ended.
+    /// A long-poll never ends, so a caller reading one stops when it has what it
+    /// came for rather than when this says to.
+    pub async fn read_chunk(
+        &mut self,
+        stream: u32,
+        body_out: &mut [u8],
+    ) -> Result<(usize, bool), H2Error> {
         loop {
             let frame = self.next_frame().await?;
             // Split so the frame stays borrowed from `self.buffer` while
             // `recv` writes its replies elsewhere.
             let mut replies = [0u8; 256];
+            let mut status = self.status;
             let (event, reply_len) = {
                 let (buffer, connection) = (&self.buffer[..frame], &mut self.connection);
                 connection.recv(
@@ -142,29 +175,34 @@ impl<'r> Http2<'r> {
                     &mut replies,
                 )?
             };
+            self.status = status;
 
+            let mut written = 0usize;
             let mut finished = false;
+            let mut failed = None;
+
             match event {
-                Event::Headers { stream: s, end_stream } if s == stream => {
-                    finished = end_stream;
-                }
+                Event::Headers {
+                    stream: s,
+                    end_stream,
+                } if s == stream => finished = end_stream,
                 Event::Data {
                     stream: s,
                     data,
                     end_stream,
                 } if s == stream => {
-                    let end = written + data.len();
-                    if end > body_out.len() {
-                        return Err(H2Error::FrameTooLarge);
+                    if data.len() > body_out.len() {
+                        failed = Some(H2Error::FrameTooLarge);
+                    } else {
+                        body_out[..data.len()].copy_from_slice(data);
+                        written = data.len();
                     }
-                    body_out[written..end].copy_from_slice(data);
-                    written = end;
                     finished = end_stream;
                 }
                 Event::Reset { stream: s, .. } if s == stream => {
-                    return Err(H2Error::Http2(micro_h2::Error::StreamReset));
+                    failed = Some(H2Error::Http2(micro_h2::Error::StreamReset));
                 }
-                Event::GoAway { .. } => return Err(H2Error::Http2(micro_h2::Error::GoAway)),
+                Event::GoAway { .. } => failed = Some(H2Error::Http2(micro_h2::Error::GoAway)),
                 _ => {}
             }
 
@@ -172,10 +210,18 @@ impl<'r> Http2<'r> {
             if reply_len > 0 {
                 self.send(&replies[..reply_len]).await?;
             }
-            if finished {
-                return Ok((status, written));
+            if let Some(e) = failed {
+                return Err(e);
+            }
+            if written > 0 || finished {
+                return Ok((written, finished));
             }
         }
+    }
+
+    /// The status of the most recent response.
+    pub fn status(&self) -> u16 {
+        self.status
     }
 
     /// Seal and send, splitting across records when needed.

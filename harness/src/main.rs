@@ -113,7 +113,8 @@ const USAGE: &str = "usage:
 <peer ip> <peer port>
   harness selftest <state dir>
   harness ts2021   <state dir> <server ip> <port>
-  harness register <state dir> <server ip> <port> <preauth key> [--exit-node|--rotate]";
+  harness register <state dir> <server ip> <port> <preauth key> [--exit-node|--rotate]
+  harness map      <state dir> <server ip> <port>";
 
 extern "C" fn rust_start(stack: *const usize) -> ! {
     let args = Args { stack };
@@ -140,6 +141,27 @@ extern "C" fn rust_start(stack: *const usize) -> ! {
             let ip = parse_ipv4(ip).expect("server address must be IPv4");
             let port = parse_u16(port).expect("port must be a number");
             control::run(state_dir, ip, port)
+        }
+        Some("map") => {
+            let (Some(state_dir), Some(ip), Some(port)) = (args.get(2), args.get(3), args.get(4))
+            else {
+                println!("{USAGE}");
+                rt::exit(2)
+            };
+            let ip = parse_ipv4(ip).expect("server address must be IPv4");
+            let port = parse_u16(port).expect("port must be a number");
+            let mut stream = false;
+            let mut read_only = false;
+            let mut omit_peers = false;
+            for index in 5..9 {
+                match args.get(index) {
+                    Some("--stream") => stream = true,
+                    Some("--read-only") => read_only = true,
+                    Some("--omit-peers") => omit_peers = true,
+                    _ => {}
+                }
+            }
+            control::run_map(state_dir, ip, port, stream, read_only, omit_peers)
         }
         Some("register") => {
             let (Some(state_dir), Some(ip), Some(port), Some(auth_key)) =

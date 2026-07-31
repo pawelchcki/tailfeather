@@ -12,10 +12,12 @@
 
 pub mod hostinfo;
 pub mod json;
+pub mod map;
 pub mod register;
 
 pub use hostinfo::{EXIT_NODE_ROUTES, Hostinfo};
 pub use json::{JsonError, Writer};
+pub use map::MapRequest;
 pub use register::{RegisterRequest, RegisterResponse};
 
 /// The capability version this client speaks, taken from [`ts_noise`] so the
