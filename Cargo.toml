@@ -8,7 +8,7 @@
 # is what lets plain `cargo test` here run on the host.
 [workspace]
 exclude  = ["firmware", "harness"]
-members  = ["crates/ts-conformance", "crates/wg-core"]
+members  = ["crates/ts-conformance", "crates/ts-keys", "crates/ts-noise", "crates/wg-core"]
 resolver = "3"
 
 [workspace.package]
@@ -31,7 +31,9 @@ zeroize           = { version = "1.8", default-features = false }
 heapless = "0.9"
 
 # --- internal ---
-wg-core = { path = "crates/wg-core", version = "0.1.0" }
+ts-keys  = { path = "crates/ts-keys", version = "0.1.0" }
+ts-noise = { path = "crates/ts-noise", version = "0.1.0" }
+wg-core  = { path = "crates/wg-core", version = "0.1.0" }
 
 # ChaCha20-Poly1305 is the throughput bottleneck of the whole tunnel and is
 # unusably slow when compiled without optimization, so optimize dependencies

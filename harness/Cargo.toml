@@ -20,7 +20,13 @@ heapless = "0.9"
 # above `rt` is free of `unsafe`.
 rustix = { version = "1", default-features = false, features = ["event", "fs", "net", "rand", "time"] }
 
-wg-core = { path = "../crates/wg-core" }
+ts-keys  = { path = "../crates/ts-keys" }
+ts-noise = { path = "../crates/ts-noise" }
+wg-core  = { path = "../crates/wg-core" }
+
+# Named directly because `control.rs` builds the ephemeral key for the ts2021
+# handshake; every other use of it is behind ts-keys or wg-core.
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "precomputed-tables", "zeroize"] }
 
 # There is no unwinder on a target with no libc, and nothing to unwind into.
 [profile.dev]

@@ -29,8 +29,10 @@
 //! could not run, which is never counted as success.
 
 pub mod checks;
+pub mod harness;
 pub mod http;
 pub mod multipeer;
+pub mod ts2021;
 
 use std::fmt;
 use std::path::PathBuf;
@@ -151,6 +153,13 @@ pub struct Env {
     pub vectors: PathBuf,
     pub headscale_version: Option<String>,
     pub tailscale_version: Option<String>,
+    /// The built `no_std` harness, if there is one. Checks that need it report
+    /// [`Status::Skip`] when it is absent rather than failing: an unbuilt binary
+    /// is a missing measurement, not an incompatibility.
+    pub harness: Option<harness::Harness>,
+    /// Where the lab's control server listens, split for the harness, which
+    /// parses dotted quads rather than URLs.
+    pub control_address: Option<(String, u16)>,
 }
 
 impl Env {
@@ -165,6 +174,8 @@ impl Env {
             vectors: repo_root.join("tests/vectors"),
             headscale_version: None,
             tailscale_version: None,
+            harness: harness::Harness::discover(repo_root),
+            control_address: None,
         };
 
         if let Ok(text) = std::fs::read_to_string(repo_root.join(".lab/lab.env")) {
@@ -200,6 +211,8 @@ impl Env {
             env.control_url = None;
         }
 
+        env.control_address = env.control_url.as_deref().and_then(split_address);
+
         if let Ok(text) = std::fs::read_to_string(env.vectors.join("versions.json"))
             && let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
         {
@@ -219,6 +232,14 @@ impl Env {
             .map_err(|e| format!("{}: {e} — run tests/lab/capture.sh", path.display()))?;
         serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))
     }
+}
+
+/// Split `http://host:port` into the parts the harness takes as arguments.
+fn split_address(url: &str) -> Option<(String, u16)> {
+    let rest = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://"))?;
+    let authority = rest.split('/').next()?;
+    let (host, port) = authority.rsplit_once(':')?;
+    Some((host.to_string(), port.parse().ok()?))
 }
 
 pub struct Outcome {

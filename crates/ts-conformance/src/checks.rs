@@ -8,7 +8,7 @@
 //! what is missing, so each one reads as the next piece of work rather than as
 //! a vague intention.
 
-use crate::{Area, Check, Env, Status, Target, http, multipeer};
+use crate::{Area, Check, Env, Status, Target, http, multipeer, ts2021};
 
 pub fn all() -> &'static [Check] {
     CHECKS
@@ -87,19 +87,19 @@ static CHECKS: &[Check] = &[
         id: "keys.machine",
         area: Area::Keys,
         description: "machine key: the identity the control plane knows",
-        run: |_| Status::Todo("no machine key is generated or persisted".into()),
+        run: ts2021::machine_key,
     },
     Check {
         id: "keys.node",
         area: Area::Keys,
         description: "node key: the WireGuard identity advertised in the netmap",
-        run: |_| Status::Todo("the WireGuard key exists but is not tied to a node identity".into()),
+        run: ts2021::node_key,
     },
     Check {
         id: "keys.disco",
         area: Area::Keys,
         description: "disco key: used for path discovery",
-        run: |_| Status::Todo("no disco key".into()),
+        run: ts2021::disco_key,
     },
     Check {
         id: "keys.encoding",
@@ -132,7 +132,7 @@ static CHECKS: &[Check] = &[
         id: "keys.persistence",
         area: Area::Keys,
         description: "keys survive a reboot",
-        run: |_| Status::Todo("nothing is written to NVS; a reboot would re-register".into()),
+        run: ts2021::persistence,
     },
     // ------------------------------------------------------------------ transport
     Check {
@@ -213,39 +213,19 @@ static CHECKS: &[Check] = &[
         id: "control.capver.minimum",
         area: Area::Control,
         description: "advertises a capability version at or above the server's floor",
-        run: |env| {
-            let key = match env.vector("server_key.json") {
-                Ok(v) => v,
-                Err(e) => return Status::Skip(e),
-            };
-            let Some(minimum) = key["minimum_capability_version"].as_u64() else {
-                return Status::Skip("capability floor not probed; run tests/lab/capture.sh".into());
-            };
-            // Discovered by binary search against the live server rather than
-            // read from documentation, because the floor rises as servers are
-            // upgraded and a stale constant fails before any protocol runs.
-            Status::Todo(format!(
-                "no client to advertise one yet. This server rejects anything below v{minimum}"
-            ))
-        },
+        run: ts2021::capver_minimum,
     },
     Check {
         id: "control.noise.handshake",
         area: Area::Control,
         description: "completes the ts2021 Noise IK handshake",
-        run: |_| {
-            Status::Todo(
-                "no ts2021 client. Different handshake from WireGuard's (IK, not IKpsk2, \
-                 over TCP) but every primitive is already in the tree"
-                    .into(),
-            )
-        },
+        run: ts2021::noise_handshake,
     },
     Check {
         id: "control.controlbase.framing",
         area: Area::Control,
         description: "speaks the controlbase framing over the Noise channel",
-        run: |_| Status::Todo("not implemented".into()),
+        run: ts2021::controlbase_framing,
     },
     Check {
         id: "control.register",

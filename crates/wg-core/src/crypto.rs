@@ -110,27 +110,33 @@ pub fn dh(secret: &StaticSecret, public: &PublicKey) -> Result<Key, Error> {
     Ok(shared.to_bytes())
 }
 
-/// WireGuard's AEAD nonce: 4 zero bytes followed by a 64-bit little-endian
-/// counter.
-fn nonce(counter: u64) -> chacha20poly1305::Nonce {
-    let mut n = [0u8; 12];
-    n[4..].copy_from_slice(&counter.to_le_bytes());
-    n.into()
-}
+/// The AEAD nonce length ChaCha20-Poly1305 uses.
+pub const NONCE_LEN: usize = 12;
 
-/// Seal `buffer` in place, returning the authentication tag.
-pub fn aead_seal(key: &Key, counter: u64, aad: &[u8], buffer: &mut [u8]) -> [u8; TAG_LEN] {
+/// A 96-bit AEAD nonce.
+pub type Nonce = [u8; NONCE_LEN];
+
+/// Seal `buffer` in place under an explicit nonce, returning the tag.
+///
+/// Protocols built on Noise all derive the nonce from a message counter, but
+/// they do not agree on how. WireGuard writes the counter little-endian;
+/// Tailscale's control protocol writes the same counter big-endian. Taking the
+/// nonce as bytes means each protocol states its own convention at the point of
+/// use, where the disagreement is visible, rather than inheriting whichever one
+/// happened to be baked in here — a mistake that produces a valid-looking
+/// ciphertext the peer silently rejects.
+pub fn aead_seal_nonce(key: &Key, nonce: &Nonce, aad: &[u8], buffer: &mut [u8]) -> [u8; TAG_LEN] {
     let cipher = ChaCha20Poly1305::new(AeadKey::from_slice(key));
     let tag = cipher
-        .encrypt_in_place_detached(&nonce(counter), aad, buffer)
+        .encrypt_in_place_detached(nonce.into(), aad, buffer)
         .expect("in-place detached sealing cannot fail for an in-range buffer");
     tag.into()
 }
 
-/// Open `buffer` in place, verifying `tag`.
-pub fn aead_open(
+/// Open `buffer` in place under an explicit nonce, verifying `tag`.
+pub fn aead_open_nonce(
     key: &Key,
-    counter: u64,
+    nonce: &Nonce,
     aad: &[u8],
     buffer: &mut [u8],
     tag: &[u8],
@@ -140,12 +146,83 @@ pub fn aead_open(
     }
     let cipher = ChaCha20Poly1305::new(AeadKey::from_slice(key));
     cipher
-        .decrypt_in_place_detached(&nonce(counter), aad, buffer, Tag::from_slice(tag))
+        .decrypt_in_place_detached(nonce.into(), aad, buffer, Tag::from_slice(tag))
         .map_err(|_| Error::Decryption)
+}
+
+/// WireGuard's AEAD nonce: 4 zero bytes followed by a 64-bit little-endian
+/// counter.
+pub fn nonce_le(counter: u64) -> Nonce {
+    let mut n = [0u8; NONCE_LEN];
+    n[4..].copy_from_slice(&counter.to_le_bytes());
+    n
+}
+
+/// Seal `buffer` in place under WireGuard's nonce convention.
+pub fn aead_seal(key: &Key, counter: u64, aad: &[u8], buffer: &mut [u8]) -> [u8; TAG_LEN] {
+    aead_seal_nonce(key, &nonce_le(counter), aad, buffer)
+}
+
+/// Open `buffer` in place under WireGuard's nonce convention.
+pub fn aead_open(
+    key: &Key,
+    counter: u64,
+    aad: &[u8],
+    buffer: &mut [u8],
+    tag: &[u8],
+) -> Result<(), Error> {
+    aead_open_nonce(key, &nonce_le(counter), aad, buffer, tag)
 }
 
 /// Constant-time equality, for comparing MACs and other attacker-supplied
 /// values against expected ones.
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.ct_eq(b).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two byte orders must not be interchangeable, or the bug this API
+    /// exists to prevent would be invisible.
+    ///
+    /// WireGuard puts the counter in the low bytes; Tailscale's control
+    /// protocol puts it in the high bytes of the same twelve. For counter 1
+    /// they differ, and a ciphertext sealed under one cannot be opened under the
+    /// other — which is what the second half of this test checks, because that
+    /// is the failure a caller would actually see.
+    #[test]
+    fn the_two_nonce_conventions_disagree() {
+        let mut big_endian = [0u8; NONCE_LEN];
+        big_endian[4..].copy_from_slice(&1u64.to_be_bytes());
+        let little_endian = nonce_le(1);
+
+        assert_ne!(big_endian, little_endian);
+        assert_eq!(little_endian, [0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(big_endian, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+
+        let key = [0x5a; KEY_LEN];
+        let mut buffer = *b"sixteen bytes...";
+        let tag = aead_seal_nonce(&key, &big_endian, &[], &mut buffer);
+        assert_eq!(
+            aead_open_nonce(&key, &little_endian, &[], &mut buffer, &tag),
+            Err(Error::Decryption)
+        );
+        assert_eq!(
+            aead_open_nonce(&key, &big_endian, &[], &mut buffer, &tag),
+            Ok(())
+        );
+        assert_eq!(&buffer, b"sixteen bytes...");
+    }
+
+    /// Counter zero is the one value where the two agree, which is why a
+    /// handshake built on the wrong convention still passes its first message
+    /// and fails on the second.
+    #[test]
+    fn counter_zero_hides_the_difference() {
+        let mut big_endian = [0u8; NONCE_LEN];
+        big_endian[4..].copy_from_slice(&0u64.to_be_bytes());
+        assert_eq!(big_endian, nonce_le(0));
+    }
 }

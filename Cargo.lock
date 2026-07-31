@@ -347,7 +347,28 @@ name = "ts-conformance"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "ts-noise",
  "wg-core",
+]
+
+[[package]]
+name = "ts-keys"
+version = "0.1.0"
+dependencies = [
+ "subtle",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
+name = "ts-noise"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "ts-keys",
+ "wg-core",
+ "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]

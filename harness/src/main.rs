@@ -28,6 +28,7 @@
 #[macro_use]
 mod rt;
 
+mod control;
 mod exec;
 mod inner;
 mod net;
@@ -109,7 +110,8 @@ const USAGE: &str = "usage:
   harness respond  <bind ip> <port> <private hex> <peer public hex> <tunnel ipv4>
   harness initiate <bind ip> <port> <private hex> <peer public hex> <tunnel ipv4> \
 <peer ip> <peer port>
-  harness selftest <state dir>";
+  harness selftest <state dir>
+  harness ts2021   <state dir> <server ip> <port>";
 
 extern "C" fn rust_start(stack: *const usize) -> ! {
     let args = Args { stack };
@@ -126,6 +128,17 @@ extern "C" fn rust_start(stack: *const usize) -> ! {
             wg::run_initiator(config, SocketAddrV4::new(peer_ip, peer_port))
         }
         Some("selftest") => selftest::run(args.get(2).unwrap_or("/tmp/harness-selftest")),
+        Some("ts2021") => {
+            let (Some(state_dir), Some(ip), Some(port)) =
+                (args.get(2), args.get(3), args.get(4))
+            else {
+                println!("{USAGE}");
+                rt::exit(2)
+            };
+            let ip = parse_ipv4(ip).expect("server address must be IPv4");
+            let port = parse_u16(port).expect("port must be a number");
+            control::run(state_dir, ip, port)
+        }
         _ => {
             println!("{USAGE}");
             rt::exit(2)

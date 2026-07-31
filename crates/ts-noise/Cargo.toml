@@ -1,0 +1,21 @@
+[package]
+name        = "ts-noise"
+description = "The Tailscale ts2021 control-plane transport: Noise IK over TCP, controlbase framing, and the HTTP/1.1 upgrade that starts it"
+readme      = "README.md"
+keywords    = ["tailscale", "noise", "no-std", "embedded", "sans-io"]
+categories  = ["network-programming", "no-std", "cryptography"]
+
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+rust-version.workspace = true
+version.workspace      = true
+
+[dependencies]
+ts-keys.workspace      = true
+wg-core.workspace      = true
+x25519-dalek.workspace = true
+zeroize.workspace      = true
+
+[dev-dependencies]
+hex = "0.4"

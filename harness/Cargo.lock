@@ -171,7 +171,10 @@ version = "0.1.0"
 dependencies = [
  "heapless",
  "rustix",
+ "ts-keys",
+ "ts-noise",
  "wg-core",
+ "x25519-dalek",
 ]
 
 [[package]]
@@ -313,6 +316,25 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "ts-keys"
+version = "0.1.0"
+dependencies = [
+ "subtle",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
+name = "ts-noise"
+version = "0.1.0"
+dependencies = [
+ "ts-keys",
+ "wg-core",
+ "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]
