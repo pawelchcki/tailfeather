@@ -9,7 +9,8 @@
 //! a vague intention.
 
 use crate::{
-    Area, Check, Env, Status, Target, disco, exit, http, multipeer, netmap, register, ts2021,
+    Area, Check, Env, Status, Target, disco, exit, http, multipeer, netmap, register, tls,
+    ts2021,
 };
 
 pub fn all() -> &'static [Check] {
@@ -141,14 +142,7 @@ static CHECKS: &[Check] = &[
         id: "transport.tls",
         area: Area::Transport,
         description: "TLS 1.3 client, required by the hosted service",
-        run: |_| {
-            Status::Todo(
-                "no TLS client. Headscale on a LAN accepts plain HTTP, but \
-                 controlplane.tailscale.com does not, so this gates hosted support. \
-                 embedded-tls is the candidate"
-                    .into(),
-            )
-        },
+        run: tls::tls,
     },
     Check {
         id: "transport.http2",

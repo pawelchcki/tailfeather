@@ -37,6 +37,7 @@ pub mod http;
 pub mod multipeer;
 pub mod netmap;
 pub mod register;
+pub mod tls;
 pub mod ts2021;
 
 use std::fmt;

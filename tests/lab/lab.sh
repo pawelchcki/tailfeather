@@ -16,6 +16,7 @@
 #   tests/lab/lab.sh preauth-key   # mint another key
 #   tests/lab/lab.sh reference     # join a real tailscaled to the lab as ground truth
 #   tests/lab/lab.sh nodes         # what the server thinks is registered
+#   tests/lab/lab.sh prune         # delete the nodes conformance runs left behind
 
 set -euo pipefail
 
@@ -98,6 +99,32 @@ cmd_preauth_key() {
         python3 -c "import json,sys; print(json.load(sys.stdin)['key'])"
 }
 
+# Every conformance run registers a node, and they accumulate. That is not
+# cosmetic: a netmap naming more peers than a device can hold is refused rather
+# than silently truncated, so after enough runs the netmap checks start failing
+# for a reason that has nothing to do with the code. Pruning is part of running
+# the suite, not a tidy-up.
+cmd_prune() {
+    require_container
+    local ids
+    ids="$(hs nodes list --output json 2>/dev/null |
+        python3 -c "
+import json,sys
+for node in json.load(sys.stdin):
+    if node.get('name','').startswith('esp-gateway'):
+        print(node['id'])
+")"
+    if [[ -z "$ids" ]]; then
+        echo "== no test nodes to prune"
+        return
+    fi
+    local count=0
+    for id in $ids; do
+        hs nodes delete --identifier "$id" --force >/dev/null 2>&1 && count=$((count + 1))
+    done
+    echo "== pruned $count test node(s)"
+}
+
 cmd_reference() {
     require_container
     # shellcheck disable=SC1090
@@ -167,8 +194,9 @@ case "${1:-}" in
     reference) cmd_reference ;;
     reference-stop) cmd_reference_stop ;;
     nodes) cmd_nodes ;;
+    prune) cmd_prune ;;
     *)
-        echo "usage: $0 {up|down|status|preauth-key|reference|reference-stop|nodes}" >&2
+        echo "usage: $0 {up|down|status|preauth-key|reference|reference-stop|nodes|prune}" >&2
         exit 2
         ;;
 esac

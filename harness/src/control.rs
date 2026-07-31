@@ -367,7 +367,7 @@ async fn read_early_payload(session: &mut Ts2021<'_>) -> Result<(), ControlError
 /// Deliberately crude: the `/key` response is one object with two string
 /// fields, and a real parser arrives with the netmap, which is the first thing
 /// that needs one.
-fn json_string<'a>(body: &'a [u8], field: &str) -> Option<&'a str> {
+pub fn json_string<'a>(body: &'a [u8], field: &str) -> Option<&'a str> {
     let text = core::str::from_utf8(body).ok()?;
     let mut pattern = [0u8; 64];
     let quoted = {

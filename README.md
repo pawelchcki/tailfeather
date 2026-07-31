@@ -96,6 +96,7 @@ harness/…/harness selftest /tmp/harness-state  # the runtime itself: reactor, 
 sudo scripts/interop-wireguard.sh              # M2 against real kernel WireGuard (std example)
 sudo scripts/interop-wireguard.sh harness      # the same, via the no_std no-libc harness
 sudo scripts/interop-wireguard.sh initiator    # the harness starts the handshake; kernel answers
+tests/lab/tls.sh up                            # a TLS front for the lab, for the TLS client
 ```
 
 The interop script creates a network namespace, configures a real kernel WireGuard interface

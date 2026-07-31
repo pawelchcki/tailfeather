@@ -37,6 +37,7 @@ mod net;
 mod selftest;
 mod store;
 mod time;
+mod tls;
 mod wg;
 
 use core::net::{Ipv4Addr, SocketAddrV4};
@@ -116,7 +117,8 @@ const USAGE: &str = "usage:
   harness ts2021   <state dir> <server ip> <port>
   harness register <state dir> <server ip> <port> <preauth key> [--exit-node|--rotate]
   harness map      <state dir> <server ip> <port> [responses]
-  harness disco    <state dir> <server ip> <port> [seconds]";
+  harness disco    <state dir> <server ip> <port> [seconds]
+  harness tls      <server ip> <port> <server name> <ca der path>";
 
 extern "C" fn rust_start(stack: *const usize) -> ! {
     let args = Args { stack };
@@ -154,6 +156,17 @@ extern "C" fn rust_start(stack: *const usize) -> ! {
             let port = parse_u16(port).expect("port must be a number");
             let wanted = args.get(5).and_then(parse_u16).unwrap_or(1) as usize;
             control::run_map(state_dir, ip, port, wanted.max(1))
+        }
+        Some("tls") => {
+            let (Some(ip), Some(port), Some(name), Some(ca)) =
+                (args.get(2), args.get(3), args.get(4), args.get(5))
+            else {
+                println!("{USAGE}");
+                rt::exit(2)
+            };
+            let ip = parse_ipv4(ip).expect("server address must be IPv4");
+            let port = parse_u16(port).expect("port must be a number");
+            tls::run(ip, port, name, ca)
         }
         Some("disco") => {
             let (Some(state_dir), Some(ip), Some(port)) = (args.get(2), args.get(3), args.get(4))

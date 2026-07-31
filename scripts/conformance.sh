@@ -27,6 +27,14 @@ if [[ "$CAPTURE" -eq 1 ]]; then
     echo
 fi
 
+# Each run registers nodes, and they accumulate. A netmap naming more peers than
+# a device can hold is refused rather than truncated, so without this the netmap
+# and disco checks eventually fail for a reason unrelated to the code.
+if tests/lab/lab.sh status >/dev/null 2>&1; then
+    tests/lab/lab.sh prune || true
+    echo
+fi
+
 # The suite drives the harness as a subprocess for the checks that must be
 # proven in a binary with no libc and no allocator. Cargo discovers
 # `.cargo/config.toml` from the working directory, which is what selects the

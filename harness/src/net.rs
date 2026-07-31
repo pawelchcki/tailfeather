@@ -39,6 +39,8 @@ impl core::fmt::Display for NetError {
     }
 }
 
+impl core::error::Error for NetError {}
+
 /// Whether an error means "not ready yet" rather than "failed".
 fn would_block(e: Errno) -> bool {
     e == Errno::AGAIN || e == Errno::WOULDBLOCK || e == Errno::INTR
@@ -274,6 +276,58 @@ impl<'r> TcpStream<'r> {
                 Err(e) => return Err(NetError::Errno(e)),
             }
         }
+        Ok(())
+    }
+}
+
+/// `embedded-io-async` for the stream, so crates written against that ecosystem
+/// — `embedded-tls` today, embassy-net's own sockets later — can drive it
+/// without knowing anything about this reactor.
+///
+/// The mapping is exact rather than convenient: `Closed` becomes a zero-length
+/// read, because that is what "the peer hung up" means to a reader, and every
+/// other failure keeps its errno.
+impl embedded_io_async::Error for NetError {
+    fn kind(&self) -> embedded_io_async::ErrorKind {
+        match self {
+            Self::Closed => embedded_io_async::ErrorKind::BrokenPipe,
+            Self::NotIpv4 => embedded_io_async::ErrorKind::InvalidInput,
+            Self::Errno(e) if *e == Errno::CONNREFUSED => {
+                embedded_io_async::ErrorKind::ConnectionRefused
+            }
+            Self::Errno(e) if *e == Errno::CONNRESET => {
+                embedded_io_async::ErrorKind::ConnectionReset
+            }
+            Self::Errno(e) if *e == Errno::TIMEDOUT => embedded_io_async::ErrorKind::TimedOut,
+            Self::Errno(_) => embedded_io_async::ErrorKind::Other,
+        }
+    }
+}
+
+impl embedded_io_async::ErrorType for TcpStream<'_> {
+    type Error = NetError;
+}
+
+impl embedded_io_async::Read for TcpStream<'_> {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        match TcpStream::read(self, buf).await {
+            // A closed connection is end-of-stream to a reader, not an error.
+            // Reporting it as one makes every well-behaved shutdown look like a
+            // fault to the layer above.
+            Err(NetError::Closed) => Ok(0),
+            other => other,
+        }
+    }
+}
+
+impl embedded_io_async::Write for TcpStream<'_> {
+    async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+        TcpStream::write_all(self, buf).await.map(|()| buf.len())
+    }
+
+    async fn flush(&mut self) -> Result<(), Self::Error> {
+        // Nothing is buffered here: `write_all` does not return until the
+        // kernel has taken every byte.
         Ok(())
     }
 }

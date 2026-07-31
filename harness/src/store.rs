@@ -210,3 +210,26 @@ impl FileStore {
         rustix::fs::fsync(&file).map_err(StoreError::Errno)
     }
 }
+
+/// Read a whole file into `out`, returning its length.
+///
+/// For loading a trust anchor: small, read once, and an error if it does not
+/// fit rather than a truncated certificate that would fail to parse for a
+/// reason nobody could guess.
+pub fn read_file(path: &str, out: &mut [u8]) -> Result<usize, StoreError> {
+    let path = Path::new(&[path])?;
+    let file = rustix::fs::open(path.as_c_str(), OFlags::RDONLY, Mode::empty())
+        .map_err(StoreError::Errno)?;
+    let mut filled = 0;
+    loop {
+        if filled == out.len() {
+            return Err(StoreError::TooLarge);
+        }
+        match rustix::io::read(&file, &mut out[filled..]) {
+            Ok(0) => return Ok(filled),
+            Ok(n) => filled += n,
+            Err(Errno::INTR) => continue,
+            Err(e) => return Err(StoreError::Errno(e)),
+        }
+    }
+}
