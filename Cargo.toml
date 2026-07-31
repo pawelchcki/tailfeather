@@ -1,0 +1,45 @@
+# Root workspace: the portable, independently publishable library crates.
+#
+# `firmware/` and `harness/` are deliberately NOT members. Each needs its own
+# `.cargo/config.toml` pinning a different compilation target
+# (riscv32imac-unknown-none-elf and x86_64-unknown-linux-none respectively), and
+# cargo applies target configuration per-invocation-directory across a whole
+# workspace. Keeping them as sibling workspaces that path-depend on `crates/*`
+# is what lets plain `cargo test` here run on the host.
+[workspace]
+exclude  = ["firmware", "harness"]
+members  = ["crates/wg-core"]
+resolver = "3"
+
+[workspace.package]
+edition      = "2024"
+license      = "MIT OR Apache-2.0"
+repository   = "https://github.com/pawelchcki/esp-gateway"
+rust-version = "1.88"
+version      = "0.1.0"
+
+[workspace.dependencies]
+# --- crypto (all no_std, no-alloc) ---
+blake2            = { version = "0.10", default-features = false }
+chacha20poly1305  = { version = "0.10", default-features = false }
+hmac              = { version = "0.12", default-features = false }
+subtle            = { version = "2.6", default-features = false }
+x25519-dalek      = { version = "2", default-features = false, features = ["static_secrets", "precomputed-tables", "zeroize"] }
+zeroize           = { version = "1.8", default-features = false }
+
+# --- structure ---
+heapless = "0.9"
+
+# --- internal ---
+wg-core = { path = "crates/wg-core", version = "0.1.0" }
+
+# ChaCha20-Poly1305 is the throughput bottleneck of the whole tunnel and is
+# unusably slow when compiled without optimization, so optimize dependencies
+# even in debug builds.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+codegen-units = 1
+lto           = "fat"
+opt-level     = 3

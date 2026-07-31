@@ -57,19 +57,27 @@ milestone.
 ## Testing without hardware
 
 `harness/` targets `x86_64-unknown-linux-none` (tier 3: Linux syscall ABI, no libc, no std). It
-supplies `_start`, raw syscall wrappers for sockets and timers, and `embedded-io-async` /
-`embedded-nal-async` implementations over them — then runs the identical library crates against
-a real `wg-quick` peer and a real Headscale on the development machine. The firmware stays on
-stable Rust; only the harness needs nightly, for `-Zbuild-std=core`.
+supplies `_start` and raw syscall wrappers for sockets and timers, then runs the identical
+library crates against a real `wg-quick` peer on the development machine. The firmware stays on
+stable Rust; only the harness needs nightly, for `-Z build-std`.
 
-Each library crate additionally gets ordinary std `cargo test` on the host.
+```sh
+cargo test                                   # host unit tests for every crates/* library
+sudo scripts/interop-wireguard.sh            # M2 against real kernel WireGuard (std example)
+sudo scripts/interop-wireguard.sh harness    # the same, via the no_std no-libc harness
+```
+
+The interop script creates a network namespace, configures a real kernel WireGuard interface
+inside it, points it at our responder, and requires both a completed handshake and a successful
+in-tunnel ping. Testing against the reference implementation rather than against ourselves is
+what caught the one protocol detail we had wrong — see `crates/wg-core/README.md`.
 
 ## Milestones
 
 | ID | Goal | Verified by |
 |----|------|-------------|
 | M1 | WiFi STA + DHCP | device gets an IP, answers `ping` |
-| M2 | WireGuard responder + in-tunnel ICMP | `wg show` reports a handshake; `ping 10.99.0.1` |
+| M2 ✅ | WireGuard responder + in-tunnel ICMP | `wg show` reports a handshake; `ping 10.99.0.1` |
 | M3a | NAT via raw sockets (likely ICMP + UDP only) | `ping 1.1.1.1`, `dig @1.1.1.1` from the peer |
 | M3b | NAT via an embassy-net `Driver` shim | `curl https://…` through the tunnel; 30 min soak |
 | P0 | Headscale lab over plain HTTP, pcap ground truth | captured `/ts2021` session as test vectors |
@@ -78,6 +86,9 @@ Each library crate additionally gets ordinary std `cargo test` on the host.
 | P3 | `MapRequest` long-poll + streaming netmap parse | tailnet ping between peers |
 | P4 | Disco on the shared WireGuard socket | connections report as "direct" |
 | P5 | Exit-node advertisement + route approval | laptop routes all traffic through the device |
+
+M2 is complete and verified against the Linux kernel's WireGuard, on the host and in the
+harness. Running it on the ESP32 itself is pending hardware.
 
 ## Scope limits (v1)
 

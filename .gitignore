@@ -14,3 +14,7 @@ secrets.toml
 .idea/
 *.swp
 .DS_Store
+
+# The harness and firmware are separate workspaces with their own target dirs
+harness/target
+firmware/target

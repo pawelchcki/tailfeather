@@ -1,0 +1,29 @@
+# Its own workspace: `.cargo/config.toml` here pins
+# `x86_64-unknown-linux-none` and enables `build-std`, which cargo would
+# otherwise apply to the whole tree and break host `cargo test`.
+[workspace]
+
+[package]
+name    = "harness"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+
+[dependencies]
+wg-core = { path = "../crates/wg-core" }
+
+# There is no unwinder on a target with no libc, and nothing to unwind into.
+[profile.dev]
+panic     = "abort"
+opt-level = 1
+
+[profile.release]
+codegen-units = 1
+lto           = "fat"
+opt-level     = 3
+panic         = "abort"
+
+# ChaCha20-Poly1305 is unusably slow unoptimised, and the harness is expected to
+# carry real traffic.
+[profile.dev.package."*"]
+opt-level = 3
