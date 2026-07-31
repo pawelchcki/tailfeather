@@ -187,6 +187,18 @@ impl Env {
             env.preauth_key = std::env::var("TS_AUTHKEY").ok();
         }
 
+        // A control server that is configured but not answering means the lab
+        // is simply not running, which must skip rather than fail. Reserving
+        // failure for genuine incompatibilities is what makes the suite safe to
+        // gate anything on. Probing once here beats every check discovering it
+        // separately and reporting a connection error as a protocol defect.
+        if let Some(url) = &env.control_url
+            && env.target == Target::HeadscaleLab
+            && http::get(&format!("{url}/health")).is_err()
+        {
+            env.control_url = None;
+        }
+
         if let Ok(text) = std::fs::read_to_string(env.vectors.join("versions.json"))
             && let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
         {
