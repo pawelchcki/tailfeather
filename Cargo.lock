@@ -211,6 +211,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "micro-h2"
+version = "0.1.0"
+dependencies = [
+ "heapless",
+]
+
+[[package]]
 name = "opaque-debug"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -349,6 +356,15 @@ dependencies = [
  "serde_json",
  "ts-noise",
  "wg-core",
+]
+
+[[package]]
+name = "ts-control"
+version = "0.1.0"
+dependencies = [
+ "heapless",
+ "ts-keys",
+ "ts-noise",
 ]
 
 [[package]]

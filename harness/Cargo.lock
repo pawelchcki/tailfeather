@@ -170,7 +170,9 @@ name = "harness"
 version = "0.1.0"
 dependencies = [
  "heapless",
+ "micro-h2",
  "rustix",
+ "ts-control",
  "ts-keys",
  "ts-noise",
  "wg-core",
@@ -225,6 +227,13 @@ name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
+
+[[package]]
+name = "micro-h2"
+version = "0.1.0"
+dependencies = [
+ "heapless",
+]
 
 [[package]]
 name = "opaque-debug"
@@ -316,6 +325,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "ts-control"
+version = "0.1.0"
+dependencies = [
+ "heapless",
+ "ts-keys",
+ "ts-noise",
 ]
 
 [[package]]

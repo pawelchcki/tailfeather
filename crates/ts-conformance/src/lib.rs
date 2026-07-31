@@ -30,8 +30,10 @@
 
 pub mod checks;
 pub mod harness;
+pub mod headscale;
 pub mod http;
 pub mod multipeer;
+pub mod register;
 pub mod ts2021;
 
 use std::fmt;

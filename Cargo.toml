@@ -8,7 +8,14 @@
 # is what lets plain `cargo test` here run on the host.
 [workspace]
 exclude  = ["firmware", "harness"]
-members  = ["crates/ts-conformance", "crates/ts-keys", "crates/ts-noise", "crates/wg-core"]
+members  = [
+  "crates/micro-h2",
+  "crates/ts-conformance",
+  "crates/ts-control",
+  "crates/ts-keys",
+  "crates/ts-noise",
+  "crates/wg-core",
+]
 resolver = "3"
 
 [workspace.package]
@@ -31,6 +38,8 @@ zeroize           = { version = "1.8", default-features = false }
 heapless = "0.9"
 
 # --- internal ---
+micro-h2 = { path = "crates/micro-h2", version = "0.1.0" }
+ts-control = { path = "crates/ts-control", version = "0.1.0" }
 ts-keys  = { path = "crates/ts-keys", version = "0.1.0" }
 ts-noise = { path = "crates/ts-noise", version = "0.1.0" }
 wg-core  = { path = "crates/wg-core", version = "0.1.0" }

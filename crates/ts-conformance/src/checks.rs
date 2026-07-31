@@ -8,7 +8,7 @@
 //! what is missing, so each one reads as the next piece of work rather than as
 //! a vague intention.
 
-use crate::{Area, Check, Env, Status, Target, http, multipeer, ts2021};
+use crate::{Area, Check, Env, Status, Target, http, multipeer, register, ts2021};
 
 pub fn all() -> &'static [Check] {
     CHECKS
@@ -152,13 +152,7 @@ static CHECKS: &[Check] = &[
         id: "transport.http2",
         area: Area::Transport,
         description: "HTTP/2 client over the Noise channel",
-        run: |_| {
-            Status::Todo(
-                "no HTTP/2. HPACK's dynamic table is the sharp edge: it is stateful, so \
-                 ignoring it desynchronises every subsequent header"
-                    .into(),
-            )
-        },
+        run: register::http2,
     },
     // ---------------------------------------------------------------- control
     Check {
@@ -231,47 +225,19 @@ static CHECKS: &[Check] = &[
         id: "control.register",
         area: Area::Control,
         description: "registers with a preauth key and appears on the server",
-        run: |_| {
-            Status::Todo(
-                "not implemented. The lab mints a key and the check will assert the node \
-                 shows up in `headscale nodes list`"
-                    .into(),
-            )
-        },
+        run: register::register,
     },
     Check {
         id: "control.reauth",
         area: Area::Control,
         description: "re-registers when the node key expires",
-        run: |_| Status::Todo("not implemented".into()),
+        run: register::reauth,
     },
     Check {
         id: "control.hostinfo",
         area: Area::Control,
         description: "reports a Hostinfo the server accepts",
-        run: |env| {
-            let map = match env.vector("map_response.json") {
-                Ok(v) => v,
-                Err(e) => return Status::Skip(e),
-            };
-            // Ground truth for what a real client reports about itself. Our
-            // Hostinfo has to be close enough that the server treats us as a
-            // supported client, including a version at or above its minimum.
-            let hostinfo = map
-                .as_array()
-                .and_then(|responses| responses.iter().find_map(|r| r["Node"]["Hostinfo"].as_object()));
-            match hostinfo {
-                Some(fields) => {
-                    let mut names: Vec<&str> = fields.keys().map(String::as_str).collect();
-                    names.sort();
-                    Status::Todo(format!(
-                        "not implemented. Reference client sends: {}",
-                        names.join(", ")
-                    ))
-                }
-                None => Status::Skip("captured map has no Node.Hostinfo".into()),
-            }
-        },
+        run: register::hostinfo,
     },
     // ----------------------------------------------------------------- netmap
     Check {

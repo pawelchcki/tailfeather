@@ -46,8 +46,8 @@ crates/ts-conformance  the compatibility matrix
 crates/wg-core    sans-io no_std no-alloc WireGuard core (handshake, transport, timers)
 crates/ts-keys    machine/node/disco keys, their wire encoding, and persistence
 crates/ts-noise   ts2021 transport: Noise IK, controlbase framing, the HTTP/1.1 upgrade
-crates/micro-h2   minimal no-alloc HTTP/2 client, generic over embedded-io-async
-crates/ts-control ts2021 client: register/map logic on top of the above
+crates/micro-h2   minimal no-alloc HTTP/2 client: framing, HPACK, a few streams
+crates/ts-control control-plane messages: registration, Hostinfo, no-alloc JSON
 harness/          no_std binary for x86_64-unknown-linux-none: runs the SAME library
                   crates against real wg-quick / Headscale on the dev machine, no ESP32
 ```

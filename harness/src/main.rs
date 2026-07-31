@@ -30,6 +30,7 @@ mod rt;
 
 mod control;
 mod exec;
+mod h2;
 mod inner;
 mod net;
 mod selftest;
@@ -111,7 +112,8 @@ const USAGE: &str = "usage:
   harness initiate <bind ip> <port> <private hex> <peer public hex> <tunnel ipv4> \
 <peer ip> <peer port>
   harness selftest <state dir>
-  harness ts2021   <state dir> <server ip> <port>";
+  harness ts2021   <state dir> <server ip> <port>
+  harness register <state dir> <server ip> <port> <preauth key> [--exit-node|--rotate]";
 
 extern "C" fn rust_start(stack: *const usize) -> ! {
     let args = Args { stack };
@@ -138,6 +140,26 @@ extern "C" fn rust_start(stack: *const usize) -> ! {
             let ip = parse_ipv4(ip).expect("server address must be IPv4");
             let port = parse_u16(port).expect("port must be a number");
             control::run(state_dir, ip, port)
+        }
+        Some("register") => {
+            let (Some(state_dir), Some(ip), Some(port), Some(auth_key)) =
+                (args.get(2), args.get(3), args.get(4), args.get(5))
+            else {
+                println!("{USAGE}");
+                rt::exit(2)
+            };
+            let ip = parse_ipv4(ip).expect("server address must be IPv4");
+            let port = parse_u16(port).expect("port must be a number");
+            let mut exit_node = false;
+            let mut rotate = false;
+            for index in 6..10 {
+                match args.get(index) {
+                    Some("--exit-node") => exit_node = true,
+                    Some("--rotate") => rotate = true,
+                    _ => {}
+                }
+            }
+            control::run_register(state_dir, ip, port, auth_key, exit_node, rotate)
         }
         _ => {
             println!("{USAGE}");

@@ -20,9 +20,11 @@ heapless = "0.9"
 # above `rt` is free of `unsafe`.
 rustix = { version = "1", default-features = false, features = ["event", "fs", "net", "rand", "time"] }
 
-ts-keys  = { path = "../crates/ts-keys" }
-ts-noise = { path = "../crates/ts-noise" }
-wg-core  = { path = "../crates/wg-core" }
+micro-h2   = { path = "../crates/micro-h2" }
+ts-control = { path = "../crates/ts-control" }
+ts-keys    = { path = "../crates/ts-keys" }
+ts-noise   = { path = "../crates/ts-noise" }
+wg-core    = { path = "../crates/wg-core" }
 
 # Named directly because `control.rs` builds the ephemeral key for the ts2021
 # handshake; every other use of it is behind ts-keys or wg-core.

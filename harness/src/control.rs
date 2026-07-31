@@ -31,6 +31,10 @@ pub enum ControlError {
     Store(crate::store::StoreError),
     Identity(ts_keys::StoreError),
     Keys(ts_keys::DecodeError),
+    Http2(crate::h2::H2Error),
+    Json(ts_control::JsonError),
+    /// The server understood the request and refused it.
+    Rejected,
     /// The `/key` response did not contain a machine key.
     NoServerKey,
     /// The server answered, but not with the status we needed.
@@ -47,6 +51,9 @@ impl core::fmt::Display for ControlError {
             Self::Store(e) => write!(f, "state: {e}"),
             Self::Identity(e) => write!(f, "identity: {e}"),
             Self::Keys(e) => write!(f, "key: {e}"),
+            Self::Http2(e) => write!(f, "{e}"),
+            Self::Json(e) => write!(f, "{e}"),
+            Self::Rejected => f.write_str("the server refused the registration"),
             Self::NoServerKey => f.write_str("the server published no machine key"),
             Self::UnexpectedStatus(s) => write!(f, "the server answered {s}"),
             Self::ResponseTooLong => f.write_str("response larger than the buffer"),
@@ -90,7 +97,7 @@ pub fn run(state_dir: &str, address: Ipv4Addr, port: u16) -> ! {
     let reactor = Reactor::new(clock);
 
     match crate::exec::block_on(&reactor, connect(&reactor, state_dir, address, port)) {
-        Ok(()) => {
+        Ok(_) => {
             evt!("{{\"event\":\"ts2021\",\"result\":\"ok\"}}");
             crate::rt::exit(0)
         }
@@ -102,12 +109,13 @@ pub fn run(state_dir: &str, address: Ipv4Addr, port: u16) -> ! {
     }
 }
 
-async fn connect(
-    reactor: &Reactor,
+/// Everything up to an established channel with the early payload consumed.
+pub async fn connect<'r>(
+    reactor: &'r Reactor,
     state_dir: &str,
     address: Ipv4Addr,
     port: u16,
-) -> Result<(), ControlError> {
+) -> Result<Ts2021<'r>, ControlError> {
     let store = FileStore::new(state_dir, "identity.bin").map_err(ControlError::Store)?;
     let (identity, is_new) = ts_keys::store::load_or_create(&store, &mut OsRng).map_err(|e| {
         match e {
@@ -131,8 +139,8 @@ async fn connect(
     println!("noise session established");
     evt!("{{\"event\":\"noise\",\"result\":\"ok\"}}");
 
-    read_early_payload(&mut session).await;
-    Ok(())
+    read_early_payload(&mut session).await?;
+    Ok(session)
 }
 
 fn report_identity(identity: &Identity, is_new: bool) {
@@ -251,16 +259,23 @@ async fn handshake<'r>(
     println!("<- noise response, {} bytes", response.len());
 
     let session = handshake.consume_response(&response)?;
-    Ok(Ts2021 { stream, session })
+    Ok(Ts2021 {
+        stream,
+        session,
+        pushback: heapless::Vec::new(),
+    })
 }
 
 /// An established connection: the record layer plus the socket under it.
-struct Ts2021<'r> {
+pub struct Ts2021<'r> {
     stream: TcpStream<'r>,
     session: Session,
+    /// Decrypted bytes read past the early payload. These are already HTTP/2
+    /// and must be handed on rather than dropped.
+    pushback: heapless::Vec<u8, { ts_noise::MAX_PLAINTEXT }>,
 }
 
-impl Ts2021<'_> {
+impl<'r> Ts2021<'r> {
     /// Read and decrypt one record.
     async fn read_record(&mut self, out: &mut [u8]) -> Result<usize, ControlError> {
         let mut header = [0u8; ts_noise::HEADER_LEN];
@@ -271,33 +286,39 @@ impl Ts2021<'_> {
         self.stream.read_exact(&mut ciphertext[..len]).await?;
         Ok(self.session.open(&ciphertext[..len], out)?)
     }
+
+    /// Hand the connection to the HTTP/2 layer.
+    pub async fn into_http2(self) -> Result<crate::h2::Http2<'r>, ControlError> {
+        crate::h2::Http2::start(self.stream, self.session, &self.pushback)
+            .await
+            .map_err(ControlError::Http2)
+    }
 }
 
 /// Read records until the early-payload question is settled.
 ///
 /// The capture shows Headscale sending the nine-byte probe split across three
 /// records, so this must keep reading rather than deciding on the first one.
-async fn read_early_payload(session: &mut Ts2021<'_>) {
+async fn read_early_payload(session: &mut Ts2021<'_>) -> Result<(), ControlError> {
     let mut reader = ts_noise::EarlyReader::new();
     let mut plaintext = [0u8; ts_noise::MAX_PLAINTEXT];
 
     while !reader.is_complete() {
-        let len = match session.read_record(&mut plaintext).await {
-            Ok(len) => len,
-            Err(e) => {
-                println!("!! reading records: {e}");
-                return;
-            }
-        };
+        let len = session.read_record(&mut plaintext).await?;
         println!("<- record, {len} bytes of plaintext");
-        if let Err(e) = reader.push(&plaintext[..len]) {
-            println!("!! early payload: {e}");
-            return;
+        let consumed = reader.push(&plaintext[..len])?;
+        // A record can hold the tail of the early payload and the start of the
+        // HTTP/2 preface. Whatever was not consumed is already HTTP/2.
+        if consumed < len {
+            session
+                .pushback
+                .extend_from_slice(&plaintext[consumed..len])
+                .map_err(|_| ControlError::ResponseTooLong)?;
         }
     }
 
-    match reader.finish() {
-        Ok(ts_noise::early::Early::Payload(payload)) => {
+    match reader.finish()? {
+        ts_noise::early::Early::Payload(payload) => {
             println!("<- early payload, {} bytes", payload.len());
             match core::str::from_utf8(payload) {
                 Ok(text) => println!("   {text}"),
@@ -308,14 +329,22 @@ async fn read_early_payload(session: &mut Ts2021<'_>) {
                 payload.len()
             );
         }
-        Ok(ts_noise::early::Early::PushBack(bytes)) => {
+        ts_noise::early::Early::PushBack(bytes) => {
             // Not an error: a server without an early payload starts HTTP/2
             // immediately, and these nine bytes are its first frame header.
             println!("<- no early payload; first HTTP/2 header {}", HexBytes(bytes));
             evt!("{{\"event\":\"early\",\"present\":false}}");
+            // Those nine bytes belong to HTTP/2. Dropping them would leave its
+            // parser permanently one frame header short.
+            // Those nine bytes belong to HTTP/2. Dropping them would leave its
+            // parser permanently one frame header short.
+            let mut carried = heapless::Vec::<u8, { ts_noise::MAX_PLAINTEXT }>::new();
+            let _ = carried.extend_from_slice(bytes);
+            let _ = carried.extend_from_slice(&session.pushback);
+            session.pushback = carried;
         }
-        Err(e) => println!("!! early payload: {e}"),
     }
+    Ok(())
 }
 
 /// Pull a string field out of a flat JSON object.
@@ -360,4 +389,128 @@ fn write_host(address: Ipv4Addr, port: u16, out: &mut [u8; 32]) -> &str {
     let _ = write!(buffer, "{address}:{port}");
     let len = buffer.1;
     core::str::from_utf8(&out[..len]).expect("an address and a port are ASCII")
+}
+
+/// Register with the control server using a preauth key.
+pub fn run_register(
+    state_dir: &str,
+    address: Ipv4Addr,
+    port: u16,
+    auth_key: &str,
+    exit_node: bool,
+    rotate: bool,
+) -> ! {
+    let clock = crate::time::Clock::start();
+    let reactor = Reactor::new(clock);
+
+    let work = register(&reactor, state_dir, address, port, auth_key, exit_node, rotate);
+    match crate::exec::block_on(&reactor, work) {
+        Ok(()) => {
+            evt!("{{\"event\":\"register\",\"result\":\"ok\"}}");
+            crate::rt::exit(0)
+        }
+        Err(e) => {
+            println!("FAIL {e}");
+            evt!("{{\"event\":\"register\",\"result\":\"fail\"}}");
+            crate::rt::exit(1)
+        }
+    }
+}
+
+async fn register(
+    reactor: &Reactor,
+    state_dir: &str,
+    address: Ipv4Addr,
+    port: u16,
+    auth_key: &str,
+    exit_node: bool,
+    rotate: bool,
+) -> Result<(), ControlError> {
+    let store = FileStore::new(state_dir, "identity.bin").map_err(ControlError::Store)?;
+    let (mut identity, _) = ts_keys::store::load_or_create(&store, &mut OsRng).map_err(|e| match e {
+        ts_keys::store::IdentityError::Store(e) => ControlError::Store(e),
+        ts_keys::store::IdentityError::Format(e) => ControlError::Identity(e),
+    })?;
+
+    // Rotating replaces the node key while the machine key — the identity the
+    // control plane authenticated — stays put. That separation is the whole
+    // reason the two are different keys: the node can get a new data-plane
+    // identity without becoming a new machine.
+    let retired = rotate.then(|| identity.node.public());
+    if rotate {
+        identity.node = ts_keys::NodePrivate::generate(&mut OsRng);
+        println!("rotating node key: {} -> {}", retired.unwrap(), identity.node.public());
+    }
+
+    let session = connect(reactor, state_dir, address, port).await?;
+    let mut http2 = session.into_http2().await?;
+    println!("http/2 connection established");
+    evt!("{{\"event\":\"http2\",\"result\":\"ok\"}}");
+
+    let mut host = [0u8; 32];
+    let host = write_host(address, port, &mut host);
+
+    let node_key = identity.node.public();
+    let old_node_key = retired.as_ref();
+    let request = ts_control::RegisterRequest {
+        version: ts_control::CAPABILITY_VERSION,
+        node_key: &node_key,
+        old_node_key,
+        auth_key,
+        hostinfo: ts_control::Hostinfo {
+            routable_ips: if exit_node {
+                &ts_control::EXIT_NODE_ROUTES
+            } else {
+                &[]
+            },
+            ..Default::default()
+        },
+        ephemeral: false,
+    };
+
+    let mut body = [0u8; 1024];
+    let body = request.write(&mut body).map_err(ControlError::Json)?;
+    println!("-> POST {} ({} bytes)", ts_control::register::PATH, body.len());
+
+    let mut response = [0u8; 4096];
+    let (status, len) = http2
+        .request("POST", ts_control::register::PATH, host, body, &mut response)
+        .await
+        .map_err(ControlError::Http2)?;
+
+    let text = core::str::from_utf8(&response[..len]).unwrap_or("");
+    println!("<- {status}, {len} bytes");
+    if status != 200 {
+        println!("   {text}");
+        return Err(ControlError::UnexpectedStatus(status));
+    }
+
+    let parsed = ts_control::RegisterResponse::parse(text);
+    if !parsed.is_success() {
+        println!("   {text}");
+        if !parsed.auth_url.is_empty() {
+            // A headless node cannot follow a login URL, so this is a failure
+            // rather than a step. It is what an expired or spent preauth key
+            // looks like.
+            println!("!! the server wants an interactive login at {}", parsed.auth_url);
+        }
+        return Err(ControlError::Rejected);
+    }
+
+    // Only once the server has accepted it: persisting a key the server never
+    // saw would leave the node holding an identity nobody recognises.
+    if rotate {
+        let blob = identity.to_blob();
+        store.save(&blob.0).map_err(ControlError::Store)?;
+    }
+
+    println!("registered: node {node_key} as '{}'", parsed.login_name);
+    evt!(
+        "{{\"event\":\"registered\",\"node\":\"{}\",\"login\":\"{}\",\"exit_node\":{},\"rotated\":{}}}",
+        node_key,
+        parsed.login_name,
+        exit_node,
+        old_node_key.is_some()
+    );
+    Ok(())
 }
