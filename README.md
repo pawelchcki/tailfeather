@@ -1,9 +1,14 @@
 # esp-gateway
 
 ESP32-C6 firmware (Rust, `no_std`, Embassy) that joins a [Tailscale](https://tailscale.com)
-network coordinated by a self-hosted [Headscale](https://headscale.net) server on the LAN and
-acts as an **exit node**: WireGuard data plane, ts2021 control plane, and NAT out the WiFi
-station uplink.
+network and acts as an **exit node**: WireGuard data plane, ts2021 control plane, and NAT out
+the WiFi station uplink.
+
+The target is compatibility with **both** hosted Tailscale and self-hosted
+[Headscale](https://headscale.net), at their current versions. Those are different problems —
+Headscale on a LAN accepts plain HTTP and tolerates a client that never relays, while
+`controlplane.tailscale.com` requires TLS and DERP — so compatibility with one is not evidence
+about the other, and the test framework reports them separately.
 
 ## Why this is possible
 
@@ -16,10 +21,28 @@ station uplink.
   (`x25519-dalek`, `chacha20poly1305`, `blake2`, `crypto_box`). What does *not* exist is a
   published `no_std` WireGuard implementation, so `crates/wg-core` is ours.
 
+## Compatibility
+
+`tests/` holds a framework that measures this project against real Headscale and a real
+Tailscale client rather than against our own assumptions. It enumerates every behaviour a
+compatible node must exhibit and gives each one a status, so the gap is explicit and
+countable rather than vague.
+
+```sh
+scripts/conformance.sh --capture   # start the references, capture ground truth, print the matrix
+```
+
+**Currently 9 of 34 behaviours verified.** The data plane and exit-node forwarding are done;
+the entire control plane is not. See `tests/README.md` for what the framework has already
+established about the real servers — including that Headscale v0.29.3 rejects any client
+advertising a capability version below 113.
+
 ## Layout
 
 ```
 firmware/         ESP32-C6 binary: WiFi STA, embassy-net, tunnel, NAT
+tests/            compatibility framework: reference lab, ground-truth vectors
+crates/ts-conformance  the compatibility matrix
 crates/wg-core    sans-io no_std no-alloc WireGuard core (handshake, transport, timers)
 crates/micro-h2   minimal no-alloc HTTP/2 client, generic over embedded-io-async
 crates/ts-control ts2021 client: Noise IK + controlbase framing + register/map logic

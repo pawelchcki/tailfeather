@@ -1,0 +1,6 @@
+{
+  "headscale": "v0.29.3",
+  "tailscale_client": "1.94.2",
+  "captured_by": "tests/lab/capture.sh",
+  "note": "Expectations in the conformance suite are pinned to these versions. Re-capture after upgrading either one."
+}

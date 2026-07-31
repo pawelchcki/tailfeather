@@ -8,7 +8,7 @@
 # is what lets plain `cargo test` here run on the host.
 [workspace]
 exclude  = ["firmware", "harness"]
-members  = ["crates/wg-core"]
+members  = ["crates/ts-conformance", "crates/wg-core"]
 resolver = "3"
 
 [workspace.package]

@@ -1,0 +1,73 @@
+//! Runs the compatibility matrix under `cargo test`.
+//!
+//! The suite is not allowed to fail because work is unfinished — only because
+//! something that used to work has broken, or because a behaviour we claim is
+//! actually wrong. That keeps it runnable from the very first day rather than
+//! only once the project is complete.
+
+use std::path::PathBuf;
+
+use ts_conformance::{Env, Report, Status};
+
+fn env() -> Env {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("crates/ts-conformance sits two levels below the repository root")
+        .to_path_buf();
+    Env::discover(&repo_root)
+}
+
+#[test]
+fn no_known_incompatibilities() {
+    let report = Report::run(&env());
+    let failures: Vec<String> = report
+        .failures()
+        .map(|o| match &o.status {
+            Status::Fail(detail) => format!("{}: {}", o.id, detail),
+            _ => unreachable!("failures() yields only Fail"),
+        })
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "compatibility regressions:\n  {}",
+        failures.join("\n  ")
+    );
+}
+
+#[test]
+fn every_check_has_a_unique_stable_id() {
+    // The ids are referred to from commits and issues, so a duplicate would
+    // silently make one of them unaddressable.
+    let mut ids: Vec<&str> = ts_conformance::checks::all().iter().map(|c| c.id).collect();
+    let total = ids.len();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(total, ids.len(), "duplicate check ids");
+}
+
+#[test]
+fn the_captured_vectors_are_usable() {
+    // A vector that has gone missing or become malformed would quietly turn
+    // real checks into skips, which reads as progress rather than as breakage.
+    let env = env();
+    if !env.vectors.join("map_response.json").exists() {
+        eprintln!("no vectors captured; run tests/lab/capture.sh");
+        return;
+    }
+    let map = env.vector("map_response.json").expect("map vector parses");
+    let responses = map.as_array().expect("captured map is an array");
+    assert!(!responses.is_empty(), "captured map is empty");
+    assert!(
+        responses.iter().any(|r| r.get("Node").is_some()),
+        "no response describes this node"
+    );
+}
+
+#[test]
+fn print_the_matrix() {
+    // Not an assertion — this is how the report reaches anyone running the
+    // suite with --nocapture.
+    let report = Report::run(&env());
+    println!("{report}");
+}

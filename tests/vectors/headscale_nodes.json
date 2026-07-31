@@ -1,0 +1,104 @@
+[
+	{
+		"id": 1,
+		"machine_key": "mkey:9cef872305442a806f1c5c0a6bba1558c9d7c1b79c1d3c8ca5c4be1c9fe3cd39",
+		"node_key": "nodekey:f4dfaca7341906ffa704d7e529ad63aba59b6616ebea8c9ebbc6c84bb814ed4d",
+		"disco_key": "discokey:417095aa8fe061f907f6c6f5497a7508cc59f8e2118cfade15c924d8137cb135",
+		"ip_addresses": [
+			"100.64.0.1",
+			"fd7a:115c:a1e0::1"
+		],
+		"name": "reference-client",
+		"user": {
+			"id": 1,
+			"name": "conformance",
+			"created_at": {
+				"seconds": 1785520324,
+				"nanos": 844589610
+			}
+		},
+		"last_seen": {
+			"seconds": 1785520342,
+			"nanos": 715205849
+		},
+		"pre_auth_key": {
+			"user": {
+				"id": 1,
+				"name": "conformance",
+				"created_at": {
+					"seconds": 1785520324,
+					"nanos": 844589610
+				}
+			},
+			"id": 1,
+			"key": "hskey-auth-TCGGP6C12hwi-***",
+			"reusable": true,
+			"expiration": {
+				"seconds": 1785606725,
+				"nanos": 371446091
+			},
+			"created_at": {
+				"seconds": 1785520325,
+				"nanos": 371893702
+			}
+		},
+		"created_at": {
+			"seconds": 1785520337,
+			"nanos": 71628141
+		},
+		"register_method": 1,
+		"given_name": "reference-client",
+		"online": true
+	},
+	{
+		"id": 2,
+		"machine_key": "mkey:fb00ddaf302906f15dd924a964ff8df534100e8cb868df177d4913ee4e39e87d",
+		"node_key": "nodekey:8e07760a26199478b22a13636eeca585330878b24f673b0a25d658e0bbfb7c79",
+		"disco_key": "discokey:faec4478e48b50bb9cb24c710a30917ff0e3bfaab1c12a9e4becbcb6bf67ae0f",
+		"ip_addresses": [
+			"100.64.0.2",
+			"fd7a:115c:a1e0::2"
+		],
+		"name": "reference-client",
+		"user": {
+			"id": 1,
+			"name": "conformance",
+			"created_at": {
+				"seconds": 1785520324,
+				"nanos": 844589610
+			}
+		},
+		"last_seen": {
+			"seconds": 1785520488,
+			"nanos": 923261150
+		},
+		"pre_auth_key": {
+			"user": {
+				"id": 1,
+				"name": "conformance",
+				"created_at": {
+					"seconds": 1785520324,
+					"nanos": 844589610
+				}
+			},
+			"id": 2,
+			"key": "hskey-auth-PBnkcXVTMDhU-***",
+			"reusable": true,
+			"expiration": {
+				"seconds": 1785606879,
+				"nanos": 904056754
+			},
+			"created_at": {
+				"seconds": 1785520479,
+				"nanos": 904544734
+			}
+		},
+		"created_at": {
+			"seconds": 1785520483,
+			"nanos": 128705407
+		},
+		"register_method": 1,
+		"given_name": "reference-client-1",
+		"online": true
+	}
+]

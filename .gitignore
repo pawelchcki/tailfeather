@@ -18,3 +18,4 @@ secrets.toml
 # The harness and firmware are separate workspaces with their own target dirs
 harness/target
 firmware/target
+.lab/

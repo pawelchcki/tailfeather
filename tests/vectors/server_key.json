@@ -1,0 +1,13 @@
+{
+  "highest_rejected": 112,
+  "key_at_minimum": {
+    "legacyPublicKey": "mkey:0000000000000000000000000000000000000000000000000000000000000000",
+    "publicKey": "mkey:d7b3946fd91a9f5c1d3a18008ab5735d236373ae4c5207966e3d8d582feb2833"
+  },
+  "minimum_capability_version": 113,
+  "note": "The server rejects clients below minimum_capability_version outright. Our client must advertise at least this, and the value moves when the server is upgraded \u2014 re-probe after changing versions.",
+  "probed_range": [
+    1,
+    200
+  ]
+}

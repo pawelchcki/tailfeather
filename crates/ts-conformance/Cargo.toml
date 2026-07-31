@@ -1,0 +1,18 @@
+[package]
+name        = "ts-conformance"
+description = "Compatibility suite measuring this project against real Tailscale and Headscale"
+publish     = false
+
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+rust-version.workspace = true
+version.workspace      = true
+
+[[bin]]
+name = "conformance"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"
+wg-core.workspace = true
