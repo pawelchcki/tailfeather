@@ -80,20 +80,26 @@ milestone.
 ## Testing without hardware
 
 `harness/` targets `x86_64-unknown-linux-none` (tier 3: Linux syscall ABI, no libc, no std). It
-supplies `_start` and raw syscall wrappers for sockets and timers, then runs the identical
-library crates against a real `wg-quick` peer on the development machine. The firmware stays on
-stable Rust; only the harness needs nightly, for `-Z build-std`.
+supplies its own `_start`, reaches the kernel through `rustix` with `default-features = false`,
+and runs the identical library crates against a real `wg-quick` peer on the development machine.
+On top of that sits a small reactor — one `poll` call, no allocator, no threads — which is what
+the async control plane will be built on. The firmware stays on stable Rust; only the harness
+needs nightly, for `-Z build-std`.
 
 ```sh
-cargo test                                   # host unit tests for every crates/* library
-sudo scripts/interop-wireguard.sh            # M2 against real kernel WireGuard (std example)
-sudo scripts/interop-wireguard.sh harness    # the same, via the no_std no-libc harness
+cargo test                                     # host unit tests for every crates/* library
+harness/…/harness selftest /tmp/harness-state  # the runtime itself: reactor, sockets, storage
+sudo scripts/interop-wireguard.sh              # M2 against real kernel WireGuard (std example)
+sudo scripts/interop-wireguard.sh harness      # the same, via the no_std no-libc harness
+sudo scripts/interop-wireguard.sh initiator    # the harness starts the handshake; kernel answers
 ```
 
 The interop script creates a network namespace, configures a real kernel WireGuard interface
-inside it, points it at our responder, and requires both a completed handshake and a successful
-in-tunnel ping. Testing against the reference implementation rather than against ourselves is
-what caught the one protocol detail we had wrong — see `crates/wg-core/README.md`.
+inside it, and requires both a completed handshake and a successful in-tunnel ping. In
+`initiator` mode the kernel peer is configured with *no* endpoint, so it cannot start a
+handshake — a completed one proves ours was accepted. Testing against the reference
+implementation rather than against ourselves is what caught the one protocol detail we had wrong
+— see `crates/wg-core/README.md`.
 
 ## Milestones
 
@@ -130,9 +136,10 @@ sudo scripts/bench-exit.sh 192.168.6.163       # UDP exit-node throughput benchm
 sudo scripts/test-http.sh 192.168.6.163        # HTTP/HTTPS forwarding through the device
 ```
 
-The gateway is responder-only: it never starts a handshake. Whatever sits on the other end must
-be able to initiate, which is why the peer side is kernel WireGuard rather than our own
-`harness` — the harness is a responder too, so two of them have nothing to say to each other.
+The firmware still only responds; it never starts a handshake, so whatever sits on the other end
+must be able to initiate. `wg-core` itself now does both roles — `Device::set_initiating` turns a
+peer from one this device only answers into one it will start handshakes with, which is what a
+mesh needs — and `scripts/interop-wireguard.sh initiator` verifies that half against the kernel.
 
 ## Forwarding
 

@@ -1,0 +1,216 @@
+//! The two WireGuard roles, driven against a real peer.
+//!
+//! [`run_responder`] is milestone M2's loop: `scripts/interop-wireguard.sh` has
+//! been pointing kernel WireGuard at it since then, and its control flow is
+//! unchanged so that it keeps working as a regression canary while everything
+//! around it is rebuilt.
+//!
+//! [`run_initiator`] is the new half, and is written on the async runtime
+//! instead. That is deliberate: it means the reactor, the non-blocking sockets
+//! and the timer path are all exercised by an interop test against the Linux
+//! kernel rather than only by a self-test talking to itself.
+
+use core::net::{Ipv4Addr, SocketAddrV4};
+
+use wg_core::{Action, Device};
+
+use crate::exec::{Either, Reactor, block_on, select};
+use crate::net::UdpSocket;
+use crate::time::{Clock, tai64n};
+use crate::{OsRng, inner};
+
+/// How often a node wakes with nothing to read, to run its timers.
+const TICK_MS: u64 = 250;
+
+pub struct Config {
+    pub bind: Ipv4Addr,
+    pub port: u16,
+    pub private_key: [u8; 32],
+    pub peer_key: [u8; 32],
+    pub tunnel_ip: [u8; 4],
+}
+
+/// Wait for a peer to start a handshake, then serve it.
+pub fn run_responder(config: Config) -> ! {
+    let clock = Clock::start();
+    let reactor = Reactor::new(clock);
+
+    let mut device: Device<1> = Device::new(config.private_key);
+    let peer = device
+        .add_peer(config.peer_key, None)
+        .expect("the peer table has room for one peer");
+
+    println!("our public key: {}", crate::HexBytes(&device.public_key()));
+
+    let socket = UdpSocket::bind(&reactor, config.bind, config.port).expect("bind");
+    println!("listening on {}:{}", config.bind, config.port);
+    evt!("{{\"event\":\"ready\",\"role\":\"responder\"}}");
+
+    let mut datagram = [0u8; 2048];
+    let mut out = [0u8; wg_core::MAX_DATAGRAM_LEN];
+    let mut reply = [0u8; wg_core::MAX_DATAGRAM_LEN];
+    let mut endpoint: Option<SocketAddrV4> = None;
+
+    block_on(&reactor, async {
+        loop {
+            let received = match select(
+                socket.recv_from(&mut datagram),
+                reactor.sleep(TICK_MS),
+            )
+            .await
+            {
+                Either::First(Ok(received)) => Some(received),
+                Either::First(Err(e)) => {
+                    println!("!! recv: {e}");
+                    None
+                }
+                Either::Second(()) => None,
+            };
+
+            if let Some((len, from)) = received {
+                endpoint = Some(from);
+                match device.handle_udp(&datagram[..len], clock.now(), &mut OsRng, &mut out) {
+                    Ok(Action::Send { data, .. }) => {
+                        let n = data.len();
+                        println!("-> handshake response, {n} bytes");
+                        let _ = socket.send_to(&out[..n], &from).await;
+                    }
+                    Ok(Action::Receive { packet, .. }) => {
+                        println!("<- tunnelled packet, {} bytes", packet.len());
+                        let echo = inner::icmp_echo_reply(packet, config.tunnel_ip, &mut reply);
+                        if let Some(n) = echo {
+                            let mut sealed = [0u8; wg_core::MAX_DATAGRAM_LEN];
+                            match device.encapsulate(peer, &reply[..n], clock.now(), &mut sealed) {
+                                Ok(Action::Send { data, .. }) => {
+                                    let n = data.len();
+                                    println!("-> echo reply, {n} bytes");
+                                    let _ = socket.send_to(&sealed[..n], &from).await;
+                                }
+                                Ok(_) => {}
+                                Err(e) => println!("!! encapsulate: {e}"),
+                            }
+                        }
+                    }
+                    Ok(Action::None) => {}
+                    Err(e) => println!("!! {e}"),
+                }
+            }
+
+            let Some(to) = endpoint else { continue };
+            loop {
+                let action = device.poll_timers(clock.now(), &mut out);
+                let Action::Send { data, .. } = action else {
+                    break;
+                };
+                let n = data.len();
+                println!("-> keepalive, {n} bytes");
+                let _ = socket.send_to(&out[..n], &to).await;
+            }
+        }
+    })
+}
+
+/// Start the handshake ourselves, and keep the session up.
+pub fn run_initiator(config: Config, peer_endpoint: SocketAddrV4) -> ! {
+    let clock = Clock::start();
+    let reactor = Reactor::new(clock);
+
+    let mut device: Device<4> = Device::new(config.private_key);
+    let peer = device
+        .add_peer(config.peer_key, None)
+        .expect("the peer table has room for one peer");
+    device
+        .set_initiating(peer, true)
+        .expect("the peer was just added");
+
+    println!("our public key: {}", crate::HexBytes(&device.public_key()));
+
+    let socket = UdpSocket::bind(&reactor, config.bind, config.port).expect("bind");
+    let bound = socket.local_address().expect("getsockname");
+    println!("initiating from {bound} to {peer_endpoint}");
+    evt!("{{\"event\":\"ready\",\"role\":\"initiator\"}}");
+
+    let mut datagram = [0u8; 2048];
+    let mut out = [0u8; wg_core::MAX_DATAGRAM_LEN];
+    let mut reply = [0u8; wg_core::MAX_DATAGRAM_LEN];
+    let mut announced = false;
+
+    block_on(&reactor, async {
+        loop {
+            let now = clock.now();
+
+            // Handshakes first: until one completes there is nothing else this
+            // node can usefully do.
+            loop {
+                let timestamp = tai64n();
+                let action = device.poll_handshakes(now, &timestamp, &mut OsRng, &mut out);
+                let Action::Send { data, .. } = action else {
+                    break;
+                };
+                let n = data.len();
+                println!("-> handshake initiation, {n} bytes");
+                let _ = socket.send_to(&out[..n], &peer_endpoint).await;
+            }
+
+            loop {
+                let action = device.poll_timers(now, &mut out);
+                let Action::Send { data, .. } = action else {
+                    break;
+                };
+                let n = data.len();
+                println!("-> keepalive, {n} bytes");
+                let _ = socket.send_to(&out[..n], &peer_endpoint).await;
+            }
+
+            if !announced && device.is_connected(peer, now) {
+                announced = true;
+                println!("handshake complete");
+                evt!("{{\"event\":\"handshake\",\"role\":\"initiator\"}}");
+            }
+
+            let received = match select(
+                socket.recv_from(&mut datagram),
+                reactor.sleep(TICK_MS),
+            )
+            .await
+            {
+                Either::First(Ok(received)) => Some(received),
+                Either::First(Err(e)) => {
+                    println!("!! recv: {e}");
+                    None
+                }
+                Either::Second(()) => None,
+            };
+
+            let Some((len, from)) = received else {
+                continue;
+            };
+
+            match device.handle_udp(&datagram[..len], clock.now(), &mut OsRng, &mut out) {
+                Ok(Action::Send { data, .. }) => {
+                    let n = data.len();
+                    println!("-> {n} bytes");
+                    let _ = socket.send_to(&out[..n], &from).await;
+                }
+                Ok(Action::Receive { packet, .. }) => {
+                    println!("<- tunnelled packet, {} bytes", packet.len());
+                    let echo = inner::icmp_echo_reply(packet, config.tunnel_ip, &mut reply);
+                    if let Some(n) = echo {
+                        let mut sealed = [0u8; wg_core::MAX_DATAGRAM_LEN];
+                        match device.encapsulate(peer, &reply[..n], clock.now(), &mut sealed) {
+                            Ok(Action::Send { data, .. }) => {
+                                let n = data.len();
+                                println!("-> echo reply, {n} bytes");
+                                let _ = socket.send_to(&sealed[..n], &from).await;
+                            }
+                            Ok(_) => {}
+                            Err(e) => println!("!! encapsulate: {e}"),
+                        }
+                    }
+                }
+                Ok(Action::None) => {}
+                Err(e) => println!("!! {e}"),
+            }
+        }
+    })
+}

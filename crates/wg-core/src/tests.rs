@@ -14,7 +14,8 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::crypto::{self, Key};
 use crate::messages::{initiation, response};
-use crate::{Action, Device, Error, Instant, PeerId, Rng};
+use crate::noise;
+use crate::{Action, Device, Error, Instant, PeerId, Rng, timers};
 
 const CONSTRUCTION: &[u8] = b"Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
 const IDENTIFIER: &[u8] = b"WireGuard v1 zx2c4 Jason@zx2c4.com";
@@ -339,7 +340,7 @@ fn rejects_a_replayed_initiation() {
 }
 
 #[test]
-fn rate_limits_back_to_back_handshakes() {
+fn rate_limits_handshakes_once_the_burst_is_spent() {
     let now = Instant(1_000);
     let mut rng = TestRng(3);
     let mut device: Device<2> = Device::new(RESPONDER_KEY);
@@ -347,17 +348,37 @@ fn rate_limits_back_to_back_handshakes() {
     device
         .add_peer(initiator.static_public.to_bytes(), None)
         .unwrap();
-
-    let first = initiator.create_initiation([0x33; 32], *b"timestamp001");
     let mut out = [0u8; crate::MAX_DATAGRAM_LEN];
-    assert!(device.handle_udp(&first, now, &mut rng, &mut out).is_ok());
 
-    let second = initiator.create_initiation([0x34; 32], *b"timestamp002");
+    // A burst is allowed, because a mesh legitimately produces one. Each of
+    // these needs a strictly newer timestamp or it would be rejected as a
+    // replay before the rate limit was ever consulted.
+    for i in 0..crate::timers::HANDSHAKE_BURST {
+        let mut timestamp = *b"timestamp000";
+        timestamp[11] = b'0' + i as u8;
+        let msg = initiator.create_initiation([0x33; 32], timestamp);
+        assert!(device.handle_udp(&msg, now, &mut rng, &mut out).is_ok());
+    }
+
+    let msg = initiator.create_initiation([0x34; 32], *b"timestampzzz");
     assert_eq!(
         device
-            .handle_udp(&second, Instant(now.0 + 1), &mut rng, &mut out)
+            .handle_udp(&msg, Instant(now.0 + 1), &mut rng, &mut out)
             .unwrap_err(),
         Error::RateLimited
+    );
+
+    // And the budget recovers at the sustained rate.
+    let msg = initiator.create_initiation([0x35; 32], *b"timestampzzz");
+    assert!(
+        device
+            .handle_udp(
+                &msg,
+                Instant(now.0 + crate::timers::HANDSHAKE_RATE_LIMIT_MS),
+                &mut rng,
+                &mut out
+            )
+            .is_ok()
     );
 }
 
@@ -582,11 +603,19 @@ fn rejects_messages_that_are_malformed_or_unsupported() {
         device.handle_udp(&[], now, &mut TestRng(1), &mut out).unwrap_err(),
         Error::Malformed
     );
-    // A response and a cookie reply are both meaningless to a responder.
+    // A four-byte response is the right type but far too short to parse.
     assert_eq!(
         device.handle_udp(&[2, 0, 0, 0], now, &mut TestRng(1), &mut out).unwrap_err(),
-        Error::Unsupported
+        Error::Malformed
     );
+    // A full-length response nobody asked for has no handshake to answer.
+    assert_eq!(
+        device
+            .handle_udp(&[2; response::LEN], now, &mut TestRng(1), &mut out)
+            .unwrap_err(),
+        Error::InvalidMac
+    );
+    // A cookie reply is meaningless: we never issue cookies.
     assert_eq!(
         device.handle_udp(&[3, 0, 0, 0], now, &mut TestRng(1), &mut out).unwrap_err(),
         Error::Unsupported
@@ -616,4 +645,380 @@ fn data_for_an_unknown_session_index_is_rejected() {
     );
 }
 
-use crate::timers;
+
+// ---------------------------------------------------------------- initiator
+//
+// The initiator is the newer half, and the only thing that makes it
+// trustworthy is agreement with the ladder above — which was itself accepted
+// by the Linux kernel's WireGuard. So the first test here is a byte-for-byte
+// differential against it, and everything after it builds on that.
+
+const TIMESTAMP: [u8; 12] = *b"timestamp001";
+
+/// Drive one device's initiation into another device acting as responder, and
+/// return the peer ids each holds for the other.
+fn connect(initiator: &mut Device<4>, responder: &mut Device<4>, now: Instant) -> (PeerId, PeerId) {
+    let a = initiator.peer_by_public_key(&responder.public_key()).unwrap();
+    let b = responder.peer_by_public_key(&initiator.public_key()).unwrap();
+
+    let mut initiation = [0u8; crate::MAX_DATAGRAM_LEN];
+    let len = initiator
+        .start_handshake(a, now, &TIMESTAMP, &mut TestRng(7), &mut initiation)
+        .unwrap();
+
+    let mut response = [0u8; crate::MAX_DATAGRAM_LEN];
+    let Action::Send { data, .. } = responder
+        .handle_udp(&initiation[..len], now, &mut TestRng(8), &mut response)
+        .unwrap()
+    else {
+        panic!("an initiation must produce a response");
+    };
+    let response_len = data.len();
+
+    // The initiator answers a completed handshake with a keepalive, which is
+    // what lets the responder confirm its own keys.
+    let mut keepalive = [0u8; crate::MAX_DATAGRAM_LEN];
+    let Action::Send { data, .. } = initiator
+        .handle_udp(&response[..response_len], now, &mut TestRng(9), &mut keepalive)
+        .unwrap()
+    else {
+        panic!("a response must produce a confirming keepalive");
+    };
+    let keepalive_len = data.len();
+
+    let mut sink = [0u8; crate::MAX_DATAGRAM_LEN];
+    assert!(matches!(
+        responder.handle_udp(&keepalive[..keepalive_len], now, &mut TestRng(10), &mut sink),
+        Ok(Action::None)
+    ));
+    (a, b)
+}
+
+/// Two devices that know each other, with the first set to initiate.
+fn pair() -> (Device<4>, Device<4>) {
+    let mut a: Device<4> = Device::new(INITIATOR_KEY);
+    let mut b: Device<4> = Device::new(RESPONDER_KEY);
+    let peer = a.add_peer(b.public_key(), None).unwrap();
+    a.set_initiating(peer, true).unwrap();
+    b.add_peer(a.public_key(), None).unwrap();
+    (a, b)
+}
+
+#[test]
+fn our_initiation_matches_the_kernel_verified_ladder_byte_for_byte() {
+    // `Initiator` above restates the construction independently and was
+    // validated by a real `wg` interface accepting what it produced. If
+    // `noise::create_initiation` disagrees with it on a single byte, one of the
+    // two has drifted from the specification.
+    let responder_key = Device::<1>::new(RESPONDER_KEY).public_key();
+    let responder_public = PublicKey::from(responder_key);
+    let ephemeral = [0x33; 32];
+    // The value `Initiator` hard-codes, so the two messages are comparable.
+    const LOCAL_INDEX: u32 = 0x1122_3344;
+
+    let mut expected = Initiator::new(INITIATOR_KEY, responder_key, None);
+    let reference = expected.create_initiation(ephemeral, TIMESTAMP);
+
+    let static_private = StaticSecret::from(INITIATOR_KEY);
+    let static_public = PublicKey::from(&static_private);
+    let mut ours = [0u8; crate::MAX_DATAGRAM_LEN];
+    let (len, _) = noise::create_initiation(
+        &static_private,
+        &static_public,
+        &responder_public,
+        LOCAL_INDEX,
+        &StaticSecret::from(ephemeral),
+        &TIMESTAMP,
+        &mut ours,
+    )
+    .unwrap();
+
+    assert_eq!(len, initiation::LEN);
+    assert_eq!(&ours[..len], &reference[..]);
+}
+
+#[test]
+fn a_device_initiates_and_carries_data_both_ways() {
+    let now = Instant(1_000);
+    let (mut a, mut b) = pair();
+    let (peer_b, peer_a) = connect(&mut a, &mut b, now);
+
+    assert!(a.is_connected(peer_b, now));
+    assert!(b.is_connected(peer_a, now));
+
+    // Initiator to responder.
+    let packet = ipv4_packet(8);
+    let total = 28;
+    let mut datagram = [0u8; crate::MAX_DATAGRAM_LEN];
+    let Action::Send { data, .. } = a
+        .encapsulate(peer_b, &packet[..total], now, &mut datagram)
+        .unwrap()
+    else {
+        panic!("encapsulate must produce a datagram");
+    };
+    let len = data.len();
+    let mut plain = [0u8; crate::MAX_DATAGRAM_LEN];
+    let Ok(Action::Receive { packet: got, .. }) =
+        b.handle_udp(&datagram[..len], now, &mut TestRng(1), &mut plain)
+    else {
+        panic!("the responder must decrypt what the initiator sealed");
+    };
+    assert_eq!(got, &packet[..total]);
+
+    // And back.
+    let mut datagram = [0u8; crate::MAX_DATAGRAM_LEN];
+    let Action::Send { data, .. } = b
+        .encapsulate(peer_a, &packet[..total], now, &mut datagram)
+        .unwrap()
+    else {
+        panic!("encapsulate must produce a datagram");
+    };
+    let len = data.len();
+    let mut plain = [0u8; crate::MAX_DATAGRAM_LEN];
+    let Ok(Action::Receive { packet: got, .. }) =
+        a.handle_udp(&datagram[..len], now, &mut TestRng(1), &mut plain)
+    else {
+        panic!("the initiator must decrypt what the responder sealed");
+    };
+    assert_eq!(got, &packet[..total]);
+}
+
+#[test]
+fn a_preshared_key_mismatch_fails_at_the_initiator() {
+    let now = Instant(1_000);
+    let mut a: Device<4> = Device::new(INITIATOR_KEY);
+    let mut b: Device<4> = Device::new(RESPONDER_KEY);
+    let peer_b = a.add_peer(b.public_key(), Some([0x01; 32])).unwrap();
+    b.add_peer(a.public_key(), Some([0x02; 32])).unwrap();
+
+    let mut initiation = [0u8; crate::MAX_DATAGRAM_LEN];
+    let len = a
+        .start_handshake(peer_b, now, &TIMESTAMP, &mut TestRng(7), &mut initiation)
+        .unwrap();
+    let mut response = [0u8; crate::MAX_DATAGRAM_LEN];
+    let Action::Send { data, .. } = b
+        .handle_udp(&initiation[..len], now, &mut TestRng(8), &mut response)
+        .unwrap()
+    else {
+        panic!("the responder cannot tell the PSK is wrong and replies anyway");
+    };
+    let response_len = data.len();
+
+    // The PSK is mixed in before the tag is checked, so a mismatch surfaces
+    // here rather than as silently unreadable traffic later.
+    let mut out = [0u8; crate::MAX_DATAGRAM_LEN];
+    assert_eq!(
+        a.handle_udp(&response[..response_len], now, &mut TestRng(9), &mut out)
+            .unwrap_err(),
+        Error::Decryption
+    );
+}
+
+#[test]
+fn a_response_to_a_handshake_we_never_started_is_rejected() {
+    let now = Instant(1_000);
+    let (mut a, mut b) = pair();
+    let peer_b = a.peer_by_public_key(&b.public_key()).unwrap();
+
+    let mut initiation = [0u8; crate::MAX_DATAGRAM_LEN];
+    let len = a
+        .start_handshake(peer_b, now, &TIMESTAMP, &mut TestRng(7), &mut initiation)
+        .unwrap();
+    let mut response = [0u8; crate::MAX_DATAGRAM_LEN];
+    let Action::Send { data, .. } = b
+        .handle_udp(&initiation[..len], now, &mut TestRng(8), &mut response)
+        .unwrap()
+    else {
+        panic!("an initiation must produce a response");
+    };
+    let response_len = data.len();
+
+    // Rewrite the receiver index so it answers nothing we have in flight. The
+    // mac1 still verifies — it covers a prefix that stops short of the index —
+    // so this exercises the lookup rather than the screening.
+    response[response::RECEIVER].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+    let mac1 = crypto::mac(
+        &noise::mac1_key(&PublicKey::from(a.public_key())),
+        &[&response[response::MAC1_INPUT]],
+    );
+    response[response::MAC1].copy_from_slice(&mac1);
+
+    let mut out = [0u8; crate::MAX_DATAGRAM_LEN];
+    assert_eq!(
+        a.handle_udp(&response[..response_len], now, &mut TestRng(9), &mut out)
+            .unwrap_err(),
+        Error::UnknownSession
+    );
+}
+
+#[test]
+fn poll_handshakes_initiates_then_waits_for_the_retry_timer() {
+    let mut now = Instant(1_000);
+    let (mut a, _) = pair();
+    let mut out = [0u8; crate::MAX_DATAGRAM_LEN];
+
+    // With no session, an initiation is due immediately.
+    assert!(matches!(
+        a.poll_handshakes(now, &TIMESTAMP, &mut TestRng(7), &mut out),
+        Action::Send { .. }
+    ));
+    // But only one: the peer is now waiting for a response.
+    assert!(matches!(
+        a.poll_handshakes(now, &TIMESTAMP, &mut TestRng(7), &mut out),
+        Action::None
+    ));
+
+    now = Instant(now.0 + timers::REKEY_TIMEOUT_MS - 1);
+    assert!(matches!(
+        a.poll_handshakes(now, &TIMESTAMP, &mut TestRng(7), &mut out),
+        Action::None
+    ));
+
+    // A response never came, so the initiation is repeated.
+    now = Instant(1_000 + timers::REKEY_TIMEOUT_MS);
+    assert!(matches!(
+        a.poll_handshakes(now, &TIMESTAMP, &mut TestRng(7), &mut out),
+        Action::Send { .. }
+    ));
+
+    let peer = a.peer_by_public_key(&Device::<4>::new(RESPONDER_KEY).public_key()).unwrap();
+    assert!(!a.handshake_is_stalled(peer, now));
+    assert!(a.handshake_is_stalled(peer, Instant(1_000 + timers::REKEY_ATTEMPT_TIME_MS)));
+}
+
+#[test]
+fn poll_handshakes_rekeys_before_the_session_expires() {
+    let now = Instant(1_000);
+    let (mut a, mut b) = pair();
+    let (peer_b, _) = connect(&mut a, &mut b, now);
+    let mut out = [0u8; crate::MAX_DATAGRAM_LEN];
+
+    // A fresh session needs nothing.
+    assert!(matches!(
+        a.poll_handshakes(now, &TIMESTAMP, &mut TestRng(7), &mut out),
+        Action::None
+    ));
+
+    let rekey = Instant(now.0 + timers::REKEY_AFTER_TIME_MS);
+    assert!(matches!(
+        a.poll_handshakes(rekey, &TIMESTAMP, &mut TestRng(7), &mut out),
+        Action::Send { .. }
+    ));
+    // The old session is still usable while the new handshake is in flight,
+    // which is the whole reason the rekey deadline precedes the reject one.
+    assert!(a.is_connected(peer_b, rekey));
+}
+
+#[test]
+fn a_device_holds_independent_sessions_with_many_peers() {
+    let now = Instant(1_000);
+    let keys: [[u8; 32]; 3] = [[0x21; 32], [0x22; 32], [0x23; 32]];
+
+    let mut hub: Device<4> = Device::new(RESPONDER_KEY);
+    let mut spokes: [Device<4>; 3] = [
+        Device::new(keys[0]),
+        Device::new(keys[1]),
+        Device::new(keys[2]),
+    ];
+    let mut hub_peers = [PeerId(0); 3];
+    for (i, spoke) in spokes.iter_mut().enumerate() {
+        hub_peers[i] = hub.add_peer(spoke.public_key(), None).unwrap();
+        let p = spoke.add_peer(hub.public_key(), None).unwrap();
+        spoke.set_initiating(p, true).unwrap();
+    }
+    assert_eq!(hub.peer_count(), 3);
+
+    // Every spoke initiates, and each handshake must land on its own peer slot
+    // rather than the one the previous handshake used.
+    for (i, spoke) in spokes.iter_mut().enumerate() {
+        let mut timestamp = TIMESTAMP;
+        timestamp[11] = b'0' + i as u8;
+        let peer_hub = spoke.peer_by_public_key(&hub.public_key()).unwrap();
+
+        let mut initiation = [0u8; crate::MAX_DATAGRAM_LEN];
+        let len = spoke
+            .start_handshake(peer_hub, now, &timestamp, &mut TestRng(i as u64), &mut initiation)
+            .unwrap();
+        let mut response = [0u8; crate::MAX_DATAGRAM_LEN];
+        let Action::Send { peer, data } = hub
+            .handle_udp(&initiation[..len], now, &mut TestRng(100 + i as u64), &mut response)
+            .unwrap()
+        else {
+            panic!("an initiation must produce a response");
+        };
+        assert_eq!(peer, hub_peers[i], "the response must be routed to the right peer");
+        let response_len = data.len();
+
+        let mut keepalive = [0u8; crate::MAX_DATAGRAM_LEN];
+        let Action::Send { data, .. } = spoke
+            .handle_udp(&response[..response_len], now, &mut TestRng(200), &mut keepalive)
+            .unwrap()
+        else {
+            panic!("a response must produce a confirming keepalive");
+        };
+        let keepalive_len = data.len();
+        let mut sink = [0u8; crate::MAX_DATAGRAM_LEN];
+        assert!(matches!(
+            hub.handle_udp(&keepalive[..keepalive_len], now, &mut TestRng(201), &mut sink),
+            Ok(Action::None)
+        ));
+    }
+
+    // All three sessions are live at once, and traffic on each is attributed to
+    // the peer that sent it.
+    let packet = ipv4_packet(8);
+    for (i, spoke) in spokes.iter_mut().enumerate() {
+        assert!(hub.is_connected(hub_peers[i], now));
+
+        let peer_hub = spoke.peer_by_public_key(&hub.public_key()).unwrap();
+        let mut datagram = [0u8; crate::MAX_DATAGRAM_LEN];
+        let Action::Send { data, .. } = spoke
+            .encapsulate(peer_hub, &packet[..28], now, &mut datagram)
+            .unwrap()
+        else {
+            panic!("encapsulate must produce a datagram");
+        };
+        let len = data.len();
+
+        let mut plain = [0u8; crate::MAX_DATAGRAM_LEN];
+        let Ok(Action::Receive { peer, packet: got }) =
+            hub.handle_udp(&datagram[..len], now, &mut TestRng(1), &mut plain)
+        else {
+            panic!("the hub must decrypt every spoke's traffic");
+        };
+        assert_eq!(peer, hub_peers[i]);
+        assert_eq!(got, &packet[..28]);
+    }
+}
+
+#[test]
+fn one_peers_handshake_does_not_starve_another() {
+    // The rate limit used to be a device-wide "one per interval" gate, which on
+    // a mesh meant the first peer to handshake locked out every other peer for
+    // the whole interval. A burst budget is what makes many peers viable.
+    let now = Instant(1_000);
+    let mut hub: Device<4> = Device::new(RESPONDER_KEY);
+    let mut first: Device<4> = Device::new([0x21; 32]);
+    let mut second: Device<4> = Device::new([0x22; 32]);
+    let a = hub.add_peer(first.public_key(), None).unwrap();
+    let b = hub.add_peer(second.public_key(), None).unwrap();
+    let pa = first.add_peer(hub.public_key(), None).unwrap();
+    let pb = second.add_peer(hub.public_key(), None).unwrap();
+
+    let mut out = [0u8; crate::MAX_DATAGRAM_LEN];
+    let mut m1 = [0u8; crate::MAX_DATAGRAM_LEN];
+    let n1 = first.start_handshake(pa, now, &TIMESTAMP, &mut TestRng(1), &mut m1).unwrap();
+    let mut m2 = [0u8; crate::MAX_DATAGRAM_LEN];
+    let n2 = second.start_handshake(pb, now, &TIMESTAMP, &mut TestRng(2), &mut m2).unwrap();
+
+    // Both arrive in the same millisecond.
+    assert!(matches!(
+        hub.handle_udp(&m1[..n1], now, &mut TestRng(3), &mut out),
+        Ok(Action::Send { peer, .. }) if peer == a
+    ));
+    assert!(matches!(
+        hub.handle_udp(&m2[..n2], now, &mut TestRng(4), &mut out),
+        Ok(Action::Send { peer, .. }) if peer == b
+    ));
+}
+

@@ -27,5 +27,13 @@ if [[ "$CAPTURE" -eq 1 ]]; then
     echo
 fi
 
+# The suite drives the harness as a subprocess for the checks that must be
+# proven in a binary with no libc and no allocator. Cargo discovers
+# `.cargo/config.toml` from the working directory, which is what selects the
+# bare target, so this cannot be a workspace member and has to be built here.
+echo "== building the no_std harness"
+(cd harness && cargo build --release)
+echo
+
 echo "== compatibility matrix"
 cargo run -q -p ts-conformance --bin conformance

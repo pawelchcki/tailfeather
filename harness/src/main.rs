@@ -8,34 +8,44 @@
 //! the chip — is to run them somewhere just as bare. A `std` test binary would
 //! hide an accidental dependence on the hosted environment; this does not.
 //!
-//! Today it drives `wg-core` against a real `wg-quick` peer, proving milestone
-//! M2 without an ESP32 in hand. As `ts-control` and `micro-h2` arrive it will
-//! grow an async executor and register against a local Headscale.
-//!
 //! ```text
-//! harness <bind ip> <port> <our private key hex> <peer public key hex> <our tunnel ipv4>
+//! harness respond  <bind ip> <port> <private hex> <peer public hex> <tunnel ipv4>
+//! harness initiate <bind ip> <port> <private hex> <peer public hex> <tunnel ipv4> \
+//!                  <peer ip> <peer port>
+//! harness selftest <state dir>
 //! ```
+//!
+//! `respond` is milestone M2, verified by `scripts/interop-wireguard.sh`.
+//! `initiate` is its mirror: we start the handshake and kernel WireGuard
+//! answers. `selftest` exercises the runtime this binary is built on, which no
+//! host test can reach.
 
 #![no_std]
 #![no_main]
 
-mod inner;
+// Declared first and with `#[macro_use]` so `println!` and `evt!` are in scope
+// for every module below without each one importing them.
+#[macro_use]
 mod rt;
 
-use wg_core::{Action, Device, Instant, Rng};
+mod exec;
+mod inner;
+mod net;
+mod selftest;
+mod store;
+mod time;
+mod wg;
+
+use core::net::{Ipv4Addr, SocketAddrV4};
+
+use wg_core::Rng;
 
 /// The kernel's entropy pool, via `getrandom`.
-struct OsRng;
+pub struct OsRng;
 
 impl Rng for OsRng {
     fn fill_bytes(&mut self, dest: &mut [u8]) {
-        let mut filled = 0;
-        while filled < dest.len() {
-            match rt::getrandom(&mut dest[filled..]) {
-                Ok(0) | Err(_) => panic!("getrandom failed"),
-                Ok(n) => filled += n,
-            }
-        }
+        rt::getrandom(dest);
     }
 }
 
@@ -51,6 +61,12 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 /// guarantee of the 16-byte stack alignment the C ABI requires. A naked
 /// function is the only way to capture that pointer and fix the alignment
 /// before calling anything compiled normally.
+///
+/// # Safety
+///
+/// Only the kernel may call this, and only as the process entry point. It reads
+/// the argument vector from the stack pointer it was entered with, which is
+/// meaningful nowhere else.
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _start() -> ! {
@@ -89,84 +105,57 @@ impl Args {
     }
 }
 
+const USAGE: &str = "usage:
+  harness respond  <bind ip> <port> <private hex> <peer public hex> <tunnel ipv4>
+  harness initiate <bind ip> <port> <private hex> <peer public hex> <tunnel ipv4> \
+<peer ip> <peer port>
+  harness selftest <state dir>";
+
 extern "C" fn rust_start(stack: *const usize) -> ! {
     let args = Args { stack };
-    let (Some(bind_ip), Some(port), Some(private_hex), Some(peer_hex), Some(tunnel_ip)) = (
-        args.get(1),
-        args.get(2),
-        args.get(3),
-        args.get(4),
-        args.get(5),
-    ) else {
-        println!(
-            "usage: harness <bind ip> <port> <private key hex> <peer public key hex> <tunnel ipv4>"
-        );
-        rt::exit(2)
-    };
-
-    let bind_ip = parse_ipv4(bind_ip).expect("bind address must be IPv4");
-    let port = parse_u16(port).expect("port must be a number");
-    let tunnel_ip = parse_ipv4(tunnel_ip).expect("tunnel address must be IPv4");
-
-    let mut device: Device<1> = Device::new(parse_key(private_hex));
-    let peer = device
-        .add_peer(parse_key(peer_hex), None)
-        .expect("the peer table has room for one peer");
-
-    println!("our public key: {}", HexBytes(&device.public_key()));
-
-    let socket = rt::socket_udp().expect("socket");
-    rt::bind(socket, &rt::SockAddrIn::new(bind_ip, port)).expect("bind");
-
-    let started = rt::monotonic_millis();
-    let mut datagram = [0u8; 2048];
-    let mut out = [0u8; wg_core::MAX_DATAGRAM_LEN];
-    let mut reply = [0u8; wg_core::MAX_DATAGRAM_LEN];
-    let mut endpoint: Option<rt::SockAddrIn> = None;
-
-    println!("listening on {}.{}.{}.{}:{}", bind_ip[0], bind_ip[1], bind_ip[2], bind_ip[3], port);
-
-    loop {
-        let now = || Instant(rt::monotonic_millis() - started);
-
-        if rt::poll_readable(socket, 250).unwrap_or(false)
-            && let Ok((len, from)) = rt::recv_from(socket, &mut datagram)
-        {
-            endpoint = Some(from);
-            match device.handle_udp(&datagram[..len], now(), &mut OsRng, &mut out) {
-                Ok(Action::Send { data, .. }) => {
-                    println!("-> handshake response, {} bytes", data.len());
-                    let _ = rt::send_to(socket, data, &from);
-                }
-                Ok(Action::Receive { packet, .. }) => {
-                    println!("<- tunnelled packet, {} bytes", packet.len());
-                    if let Some(n) = inner::icmp_echo_reply(packet, tunnel_ip, &mut reply) {
-                        let mut sealed = [0u8; wg_core::MAX_DATAGRAM_LEN];
-                        match device.encapsulate(peer, &reply[..n], now(), &mut sealed) {
-                            Ok(Action::Send { data, .. }) => {
-                                println!("-> echo reply, {} bytes", data.len());
-                                let _ = rt::send_to(socket, data, &from);
-                            }
-                            Ok(_) => {}
-                            Err(e) => println!("!! encapsulate: {}", e),
-                        }
-                    }
-                }
-                Ok(Action::None) => {}
-                Err(e) => println!("!! {}", e),
-            }
+    match args.get(1) {
+        Some("respond") => wg::run_responder(tunnel_config(&args)),
+        Some("initiate") => {
+            let config = tunnel_config(&args);
+            let (Some(peer_ip), Some(peer_port)) = (args.get(7), args.get(8)) else {
+                println!("{USAGE}");
+                rt::exit(2)
+            };
+            let peer_ip = parse_ipv4(peer_ip).expect("peer address must be IPv4");
+            let peer_port = parse_u16(peer_port).expect("peer port must be a number");
+            wg::run_initiator(config, SocketAddrV4::new(peer_ip, peer_port))
         }
-
-        while let Action::Send { data, .. } = device.poll_timers(now(), &mut out) {
-            let Some(to) = endpoint else { break };
-            println!("-> keepalive, {} bytes", data.len());
-            let _ = rt::send_to(socket, data, &to);
+        Some("selftest") => selftest::run(args.get(2).unwrap_or("/tmp/harness-selftest")),
+        _ => {
+            println!("{USAGE}");
+            rt::exit(2)
         }
     }
 }
 
+/// The five arguments both tunnel modes share.
+fn tunnel_config(args: &Args) -> wg::Config {
+    let (Some(bind_ip), Some(port), Some(private_hex), Some(peer_hex), Some(tunnel_ip)) = (
+        args.get(2),
+        args.get(3),
+        args.get(4),
+        args.get(5),
+        args.get(6),
+    ) else {
+        println!("{USAGE}");
+        rt::exit(2)
+    };
+    wg::Config {
+        bind: parse_ipv4(bind_ip).expect("bind address must be IPv4"),
+        port: parse_u16(port).expect("port must be a number"),
+        private_key: parse_key(private_hex),
+        peer_key: parse_key(peer_hex),
+        tunnel_ip: parse_octets(tunnel_ip).expect("tunnel address must be IPv4"),
+    }
+}
+
 /// Formats bytes as lowercase hex without allocating.
-struct HexBytes<'a>(&'a [u8]);
+pub struct HexBytes<'a>(pub &'a [u8]);
 
 impl core::fmt::Display for HexBytes<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -213,7 +202,7 @@ fn parse_u16(s: &str) -> Option<u16> {
     Some(value as u16)
 }
 
-fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
+fn parse_octets(s: &str) -> Option<[u8; 4]> {
     let mut octets = [0u8; 4];
     let mut parts = s.split('.');
     for slot in octets.iter_mut() {
@@ -224,4 +213,8 @@ fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
         return None;
     }
     Some(octets)
+}
+
+fn parse_ipv4(s: &str) -> Option<Ipv4Addr> {
+    parse_octets(s).map(Ipv4Addr::from)
 }

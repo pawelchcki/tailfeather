@@ -8,7 +8,7 @@
 //! what is missing, so each one reads as the next piece of work rather than as
 //! a vague intention.
 
-use crate::{Area, Check, Env, Status, Target, http};
+use crate::{Area, Check, Env, Status, Target, http, multipeer};
 
 pub fn all() -> &'static [Check] {
     CHECKS
@@ -68,9 +68,10 @@ static CHECKS: &[Check] = &[
         area: Area::DataPlane,
         description: "initiates a WireGuard handshake",
         run: |_| {
-            Status::Todo(
-                "wg-core is responder-only. A Tailscale node must initiate to its peers; \
-                 the ladder is already proven in the test-only initiator"
+            Status::External(
+                "scripts/interop-wireguard.sh initiator — kernel WireGuard, configured with no \
+                 endpoint so it cannot start one itself, accepted an initiation from wg-core and \
+                 answered the in-tunnel ping"
                     .into(),
             )
         },
@@ -79,11 +80,7 @@ static CHECKS: &[Check] = &[
         id: "wg.multipeer",
         area: Area::DataPlane,
         description: "maintains sessions with many peers at once",
-        run: |_| {
-            Status::Todo(
-                "Device is generic over PEERS but has only ever been exercised with one".into(),
-            )
-        },
+        run: |_| multipeer::run(),
     },
     // ---------------------------------------------------------------------- keys
     Check {

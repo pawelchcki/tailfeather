@@ -11,11 +11,14 @@
 //!
 //! # Scope
 //!
-//! This implementation is **responder-only**: the peer always initiates. There
-//! is no rekey logic beyond letting a session expire, at which point the peer
-//! notices and starts a fresh handshake. The cookie/`mac2` denial-of-service
-//! mechanism is not implemented either; a per-device rate limit on handshakes
-//! stands in for it. Replay protection *is* implemented in full.
+//! Both handshake roles are implemented. A peer is a pure responder until
+//! [`Device::set_initiating`] is called for it, which is what a point-to-point
+//! tunnel wants; a mesh node marks its peers as initiating and lets
+//! [`Device::poll_handshakes`] drive rekeys.
+//!
+//! The cookie/`mac2` denial-of-service mechanism is not implemented; a
+//! device-wide token bucket over handshake work stands in for it. Replay
+//! protection *is* implemented in full.
 //!
 //! # Example
 //!
@@ -57,8 +60,17 @@ pub use budget::MAX_DATAGRAM_LEN;
 pub use timers::Instant;
 
 use crypto::{Key, TIMESTAMP_LEN};
-use timers::HANDSHAKE_RATE_LIMIT_MS;
+use timers::HandshakeBudget;
 use transport::Session;
+
+/// A TAI64N timestamp, which every initiation carries.
+///
+/// The caller supplies it rather than the core reading a clock, for the same
+/// reason `now` is injected. Unlike `now` this one must come from a *real-time*
+/// clock and be comparable across reboots, because the responder rejects any
+/// initiation whose timestamp is not strictly greater than the last it accepted
+/// from us.
+pub type Tai64n = [u8; TIMESTAMP_LEN];
 
 /// A source of cryptographically secure random bytes.
 ///
@@ -150,7 +162,7 @@ struct Peer {
     preshared_key: Key,
     /// The newest TAI64N timestamp accepted from this peer. Initiations must
     /// carry strictly increasing timestamps.
-    last_timestamp: Option<[u8; TIMESTAMP_LEN]>,
+    last_timestamp: Option<Tai64n>,
     current: Option<Session>,
     /// Kept briefly after a rekey so packets still in flight under the old keys
     /// are not dropped.
@@ -158,6 +170,14 @@ struct Peer {
     /// When data last arrived with nothing sent back since, or `None` if we
     /// owe the peer nothing. See [`timers::keepalive_is_due`].
     keepalive_armed_since: Option<Instant>,
+    /// Whether this device starts handshakes with this peer, rather than only
+    /// answering the ones it starts.
+    initiating: bool,
+    /// The handshake we have in flight, if any, and when it began and was last
+    /// retried.
+    pending: Option<noise::Handshake>,
+    pending_since: Option<Instant>,
+    pending_last_sent: Option<Instant>,
 }
 
 impl Peer {
@@ -169,6 +189,30 @@ impl Peer {
         if self.previous.as_ref().is_some_and(|s| !s.is_usable(now)) {
             self.previous = None;
         }
+    }
+
+    /// Whether an initiation should be sent to this peer now.
+    fn wants_handshake(&self, now: Instant) -> bool {
+        if !self.initiating {
+            return false;
+        }
+        let needs_session = match &self.current {
+            None => true,
+            // Rekeying starts while the old session is still carrying traffic,
+            // so there is no window in which the peer is unreachable.
+            Some(session) => {
+                !session.is_usable(now) || timers::rekey_is_due(session.established(), now)
+            }
+        };
+        needs_session && timers::handshake_retry_is_due(self.pending_last_sent, now)
+    }
+
+    /// Forget any in-flight handshake. Called once a session supersedes it, and
+    /// on any state change that would make its ephemeral key useless.
+    fn clear_pending(&mut self) {
+        self.pending = None;
+        self.pending_since = None;
+        self.pending_last_sent = None;
     }
 }
 
@@ -182,7 +226,7 @@ pub struct Device<const PEERS: usize> {
     static_public: PublicKey,
     mac1_key: Key,
     peers: heapless::Vec<Peer, PEERS>,
-    last_handshake_at: Option<Instant>,
+    budget: HandshakeBudget,
 }
 
 impl<const PEERS: usize> Device<PEERS> {
@@ -195,7 +239,7 @@ impl<const PEERS: usize> Device<PEERS> {
             static_private,
             static_public,
             peers: heapless::Vec::new(),
-            last_handshake_at: None,
+            budget: HandshakeBudget::new(),
         }
     }
 
@@ -220,9 +264,53 @@ impl<const PEERS: usize> Device<PEERS> {
                 current: None,
                 previous: None,
                 keepalive_armed_since: None,
+                initiating: false,
+                pending: None,
+                pending_since: None,
+                pending_last_sent: None,
             })
             .map_err(|_| Error::TooManyPeers)?;
         Ok(id)
+    }
+
+    /// How many peers are registered.
+    pub fn peer_count(&self) -> usize {
+        self.peers.len()
+    }
+
+    /// Find a registered peer by its static public key.
+    pub fn peer_by_public_key(&self, public: &[u8; 32]) -> Option<PeerId> {
+        self.peers
+            .iter()
+            .position(|p| p.public.as_bytes() == public)
+            .map(PeerId)
+    }
+
+    /// Choose whether this device starts handshakes with `peer`.
+    ///
+    /// Off by default, which is what a device that only ever answers wants. A
+    /// node driven by a netmap turns it on: its peers are symmetric, and
+    /// whichever side notices the missing session first should start.
+    pub fn set_initiating(&mut self, peer: PeerId, initiating: bool) -> Result<(), Error> {
+        let p = self.peers.get_mut(peer.0).ok_or(Error::UnknownPeer)?;
+        p.initiating = initiating;
+        if !initiating {
+            p.clear_pending();
+        }
+        Ok(())
+    }
+
+    /// Whether a handshake with `peer` has been retrying long enough to treat
+    /// the peer as unreachable.
+    ///
+    /// The device keeps retrying regardless — a peer that comes back should
+    /// reconnect without being poked. This reports the condition so a caller can
+    /// react to it, by falling back to a relayed path, for instance.
+    pub fn handshake_is_stalled(&self, peer: PeerId, now: Instant) -> bool {
+        self.peers
+            .get(peer.0)
+            .and_then(|p| p.pending_since)
+            .is_some_and(|since| timers::handshake_has_expired(since, now))
     }
 
     /// Whether `peer` currently has a session usable for sending.
@@ -264,11 +352,150 @@ impl<const PEERS: usize> Device<PEERS> {
                     None => Ok(Action::None),
                 }
             }
-            // We never initiate, so a response is unexpected; we never issue
-            // cookies, so a cookie reply is meaningless to us.
-            messages::TYPE_RESPONSE | messages::TYPE_COOKIE_REPLY => Err(Error::Unsupported),
+            messages::TYPE_RESPONSE => {
+                let peer = self.complete_handshake(datagram, now)?;
+                // The responder cannot send until it has seen a packet open
+                // under the new keys, so the initiator owes it one immediately.
+                // Without this the tunnel is one-way until the first packet the
+                // *initiator* happens to send, which for an idle peer is never.
+                let session = self.peers[peer.0]
+                    .current
+                    .as_mut()
+                    .expect("the handshake just installed a session");
+                let len = session.seal(&[], out)?;
+                self.peers[peer.0].keepalive_armed_since = None;
+                let out: &'o [u8] = out;
+                Ok(Action::Send {
+                    peer,
+                    data: &out[..len],
+                })
+            }
+            // We never issue cookies, so a cookie reply is meaningless to us.
+            // Dropping it costs a handshake retry, which the timers already do.
+            messages::TYPE_COOKIE_REPLY => Err(Error::Unsupported),
             _ => Err(Error::Malformed),
         }
+    }
+
+    /// Start a handshake with `peer`, writing an initiation into `out`.
+    ///
+    /// Any handshake already in flight for this peer is abandoned, and its
+    /// ephemeral key with it. Existing sessions are left alone: they stay usable
+    /// until the new handshake completes, so a rekey does not interrupt traffic.
+    pub fn start_handshake(
+        &mut self,
+        peer: PeerId,
+        now: Instant,
+        timestamp: &Tai64n,
+        rng: &mut impl Rng,
+        out: &mut [u8],
+    ) -> Result<usize, Error> {
+        if self.peers.get(peer.0).is_none() {
+            return Err(Error::UnknownPeer);
+        }
+        if !self.budget.take(now) {
+            return Err(Error::RateLimited);
+        }
+
+        let local_index = self.allocate_index(rng);
+        let ephemeral = self.random_secret(rng);
+        let static_private = self.static_private.clone();
+        let static_public = self.static_public;
+
+        let p = &mut self.peers[peer.0];
+        let (len, handshake) = noise::create_initiation(
+            &static_private,
+            &static_public,
+            &p.public,
+            local_index,
+            &ephemeral,
+            timestamp,
+            out,
+        )?;
+
+        // Keep the moment the *attempt* began across retries, so the stall
+        // report measures how long the peer has been unreachable rather than
+        // how long since the last packet.
+        p.pending_since.get_or_insert(now);
+        p.pending_last_sent = Some(now);
+        p.pending = Some(handshake);
+        Ok(len)
+    }
+
+    /// Emit at most one due handshake initiation.
+    ///
+    /// Call repeatedly until it returns [`Action::None`], the same contract as
+    /// [`Device::poll_timers`]. Peers are visited in order and the token bucket
+    /// bounds the total work, so a netmap naming more peers than the budget
+    /// allows simply takes a few more ticks to converge.
+    pub fn poll_handshakes<'o>(
+        &mut self,
+        now: Instant,
+        timestamp: &Tai64n,
+        rng: &mut impl Rng,
+        out: &'o mut [u8],
+    ) -> Action<'o> {
+        for index in 0..self.peers.len() {
+            self.peers[index].expire_sessions(now);
+            if !self.peers[index].wants_handshake(now) {
+                continue;
+            }
+            match self.start_handshake(PeerId(index), now, timestamp, rng, out) {
+                Ok(len) => {
+                    let out: &'o [u8] = out;
+                    return Action::Send {
+                        peer: PeerId(index),
+                        data: &out[..len],
+                    };
+                }
+                // Out of budget: every remaining peer would fail the same way,
+                // so stop rather than walking the rest of the table.
+                Err(Error::RateLimited) => break,
+                Err(_) => continue,
+            }
+        }
+        Action::None
+    }
+
+    /// Match a type-2 response to the handshake it answers and install the
+    /// resulting session.
+    fn complete_handshake(&mut self, datagram: &[u8], now: Instant) -> Result<PeerId, Error> {
+        // Screen the message before any Diffie-Hellman work, and before
+        // spending budget, exactly as the initiation path does.
+        noise::verify_response_mac1(&self.mac1_key, datagram)?;
+
+        let receiver = messages::get_u32(&datagram[messages::response::RECEIVER]);
+        let id = self
+            .peers
+            .iter()
+            .position(|p| p.pending.as_ref().is_some_and(|h| h.local_index == receiver))
+            .map(PeerId)
+            .ok_or(Error::UnknownSession)?;
+
+        if !self.budget.take(now) {
+            return Err(Error::RateLimited);
+        }
+
+        let static_private = self.static_private.clone();
+        let peer = &mut self.peers[id.0];
+        let handshake = peer.pending.as_ref().expect("located by its pending handshake");
+        let (peer_index, keys) = noise::consume_response(
+            handshake,
+            &static_private,
+            &peer.preshared_key,
+            datagram,
+        )?;
+
+        let local_index = handshake.local_index;
+        peer.clear_pending();
+        peer.previous = peer.current.take();
+        let mut session = Session::new(keys, local_index, peer_index, now);
+        // The responder proved it derived the same keys by producing a tag we
+        // could verify, so unlike the responder we may send immediately.
+        session.confirm();
+        peer.current = Some(session);
+        peer.keepalive_armed_since = None;
+        Ok(id)
     }
 
     fn respond_to_initiation(
@@ -283,9 +510,7 @@ impl<const PEERS: usize> Device<PEERS> {
         // limit budget that protects the X25519 work below.
         noise::verify_initiation_mac1(&self.mac1_key, datagram)?;
 
-        if let Some(last) = self.last_handshake_at
-            && now.saturating_since(last) < HANDSHAKE_RATE_LIMIT_MS
-        {
+        if !self.budget.take(now) {
             return Err(Error::RateLimited);
         }
 
@@ -326,7 +551,9 @@ impl<const PEERS: usize> Device<PEERS> {
         peer.previous = peer.current.take();
         peer.current = Some(Session::new(keys, local_index, initiation.peer_index, now));
         peer.keepalive_armed_since = None;
-        self.last_handshake_at = Some(now);
+        // The peer got there first. Our own attempt, if we had one in flight,
+        // is now redundant and its ephemeral key useless.
+        peer.clear_pending();
 
         Ok((id, len))
     }

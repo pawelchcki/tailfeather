@@ -10,6 +10,16 @@ license = "MIT OR Apache-2.0"
 version = "0.1.0"
 
 [dependencies]
+# Already in the tree via wg-core; named here because the reactor's fixed
+# descriptor table is the harness's own, not something a library hands it.
+heapless = "0.9"
+
+# The Linux syscall interface. With default features off it compiles for
+# `x86_64-unknown-linux-none` with no libc, no `std` and no allocator — the same
+# instructions hand-written `asm!` would emit, but checked, so every module
+# above `rt` is free of `unsafe`.
+rustix = { version = "1", default-features = false, features = ["event", "fs", "net", "rand", "time"] }
+
 wg-core = { path = "../crates/wg-core" }
 
 # There is no unwinder on a target with no libc, and nothing to unwind into.

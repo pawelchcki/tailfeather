@@ -30,6 +30,7 @@
 
 pub mod checks;
 pub mod http;
+pub mod multipeer;
 
 use std::fmt;
 use std::path::PathBuf;

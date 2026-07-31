@@ -13,11 +13,14 @@
 #
 # Requires root (network namespaces and WireGuard interfaces both do).
 #
-# Two responders can be exercised, and both must behave identically because
-# both are the same `wg-core`:
+# Three modes. The first two are responders, and must behave identically
+# because both are the same `wg-core`. The third reverses the roles: our code
+# starts the handshake and the kernel answers, which is what a Tailscale node
+# does to its peers.
 #
-#   sudo scripts/interop-wireguard.sh            # the std `responder` example
-#   sudo scripts/interop-wireguard.sh harness    # the no_std, no-libc harness
+#   sudo scripts/interop-wireguard.sh              # the std `responder` example
+#   sudo scripts/interop-wireguard.sh harness      # the no_std, no-libc harness
+#   sudo scripts/interop-wireguard.sh initiator    # the harness initiates
 
 set -euo pipefail
 
@@ -28,6 +31,7 @@ UNDERLAY_NS=10.98.0.2
 TUNNEL_KERNEL=10.99.0.1
 TUNNEL_OURS=10.99.0.2
 PORT=51820
+KERNEL_PORT=51821
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"
@@ -45,7 +49,7 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-echo "== building responder ($MODE)"
+echo "== building ($MODE)"
 # Built as the invoking user so the target directory does not end up
 # root-owned, which would break subsequent non-root builds.
 BUILD_USER="${SUDO_USER:-root}"
@@ -62,7 +66,7 @@ case "$MODE" in
             --package wg-core --example responder
         RESPONDER="$REPO_ROOT/target/release/examples/responder"
         ;;
-    harness)
+    harness|initiator)
         # Built from inside `harness/`, not via --manifest-path: cargo
         # discovers `.cargo/config.toml` from the working directory, and that
         # file is what selects the bare `x86_64-unknown-linux-none` target.
@@ -73,7 +77,7 @@ case "$MODE" in
         RESPONDER="$REPO_ROOT/harness/target/x86_64-unknown-linux-none/release/harness"
         ;;
     *)
-        echo "unknown mode '$MODE'; expected 'example' or 'harness'" >&2
+        echo "unknown mode '$MODE'; expected 'example', 'harness' or 'initiator'" >&2
         exit 1
         ;;
 esac
@@ -102,27 +106,54 @@ ip -n "$NS" link set lo up
 echo "== configuring kernel WireGuard peer"
 ip -n "$NS" link add wg0 type wireguard
 ip -n "$NS" addr add "$TUNNEL_KERNEL/24" dev wg0
-ip netns exec "$NS" wg set wg0 \
-    private-key "$WORK/kernel.key" \
-    peer "$(cat "$WORK/ours.pub")" \
-    endpoint "$UNDERLAY_HOST:$PORT" \
-    allowed-ips "$TUNNEL_OURS/32"
+if [[ "$MODE" == "initiator" ]]; then
+    # No endpoint: the kernel must not be able to start the handshake, so a
+    # completed one proves *we* started it. It learns where to reply from the
+    # initiation we send, which is the same way it would learn a roaming peer's
+    # address.
+    ip netns exec "$NS" wg set wg0 \
+        private-key "$WORK/kernel.key" \
+        listen-port "$KERNEL_PORT" \
+        peer "$(cat "$WORK/ours.pub")" \
+        allowed-ips "$TUNNEL_OURS/32"
+else
+    ip netns exec "$NS" wg set wg0 \
+        private-key "$WORK/kernel.key" \
+        peer "$(cat "$WORK/ours.pub")" \
+        endpoint "$UNDERLAY_HOST:$PORT" \
+        allowed-ips "$TUNNEL_OURS/32"
+fi
 ip -n "$NS" link set wg0 up
 
 echo "== starting responder"
 echo "keys: ours_priv=$OURS_PRIV_HEX kernel_pub=$KERNEL_PUB_HEX"
-# The example takes a Rust-parsable socket address; the harness has no
-# address parser beyond dotted quads, so it takes host and port separately.
+# The example takes a Rust-parsable socket address; the harness has no address
+# parser beyond dotted quads, so it takes host and port separately.
 case "$MODE" in
-    example) LISTEN_ARGS=("$UNDERLAY_HOST:$PORT") ;;
-    harness) LISTEN_ARGS=("$UNDERLAY_HOST" "$PORT") ;;
+    example)
+        ARGS=("$UNDERLAY_HOST:$PORT" "$OURS_PRIV_HEX" "$KERNEL_PUB_HEX" "$TUNNEL_OURS")
+        ;;
+    harness)
+        ARGS=(respond "$UNDERLAY_HOST" "$PORT" "$OURS_PRIV_HEX" "$KERNEL_PUB_HEX" "$TUNNEL_OURS")
+        ;;
+    initiator)
+        ARGS=(initiate "$UNDERLAY_HOST" "$PORT" "$OURS_PRIV_HEX" "$KERNEL_PUB_HEX" \
+              "$TUNNEL_OURS" "$UNDERLAY_NS" "$KERNEL_PORT")
+        ;;
 esac
-"$RESPONDER" "${LISTEN_ARGS[@]}" "$OURS_PRIV_HEX" "$KERNEL_PUB_HEX" "$TUNNEL_OURS" \
-    >"$WORK/responder.log" 2>&1 &
+"$RESPONDER" "${ARGS[@]}" >"$WORK/responder.log" 2>&1 &
 RESPONDER_PID=$!
 sleep 1
 
-echo "== in-tunnel ping (kernel initiates the handshake)"
+if [[ "$MODE" == "initiator" ]]; then
+    echo "== waiting for our initiation to be answered"
+    for _ in $(seq 1 30); do
+        grep -q "handshake complete" "$WORK/responder.log" && break
+        sleep 0.5
+    done
+fi
+
+echo "== in-tunnel ping"
 PING_OK=0
 if ip netns exec "$NS" ping -c 3 -W 3 "$TUNNEL_OURS"; then
     PING_OK=1
@@ -143,6 +174,16 @@ if [[ "$HANDSHAKE" == "0" || -z "$HANDSHAKE" ]]; then
     exit 1
 fi
 echo "PASS: handshake completed"
+
+if [[ "$MODE" == "initiator" ]]; then
+    # The kernel had no endpoint configured, so it could not have sent the
+    # first message. A completed handshake means ours was accepted.
+    if ! grep -q "handshake complete" "$WORK/responder.log"; then
+        echo "FAIL: our initiation was never answered"
+        exit 1
+    fi
+    echo "PASS: kernel WireGuard accepted an initiation from wg-core"
+fi
 
 if [[ "$PING_OK" -ne 1 ]]; then
     echo "FAIL: in-tunnel ping did not get replies"
